@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ega-ihb"
+version = "0.1.0"
+description = "EGA-IHB harmonic-balance tools for nonlinear dynamic response analysis."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+examples = [
+    "matplotlib",
+]
+dev = [
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["ega_ihb*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
