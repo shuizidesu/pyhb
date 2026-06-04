@@ -8,7 +8,9 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.linalg import lu_factor, lu_solve, null_space
+from scipy import sparse
+from scipy.linalg import null_space
+from scipy.sparse.linalg import splu
 
 from .continuation import rms_amplitude
 from .harmonics import (
@@ -29,7 +31,7 @@ LinearBasisType = Literal["ddx", "dx", "x"]
 
 @dataclass(frozen=True)
 class LinearOperatorTerm:
-    matrix: NDArray[np.float64]
+    matrix: NDArray[np.float64] | sparse.spmatrix
     basis_type: LinearBasisType
     parameter_power: float
 
@@ -109,20 +111,20 @@ class _PreparedCondensedProblem:
     linear_dofs: tuple[int, ...]
     nonlinear_indices: NDArray[np.int64]
     linear_indices: NDArray[np.int64]
-    operator_ll_blocks: dict[float, NDArray[np.float64]]
-    operator_ln_blocks: dict[float, NDArray[np.float64]]
-    operator_nl_blocks: dict[float, NDArray[np.float64]]
-    operator_nn_blocks: dict[float, NDArray[np.float64]]
+    operator_ll_blocks: dict[float, sparse.csc_matrix]
+    operator_ln_blocks: dict[float, sparse.csc_matrix]
+    operator_nl_blocks: dict[float, sparse.csc_matrix]
+    operator_nn_blocks: dict[float, sparse.csc_matrix]
     forcing_l_blocks: dict[float, NDArray[np.float64]]
     forcing_n_blocks: dict[float, NDArray[np.float64]]
 
 
 @dataclass
 class _ParameterBlockSet:
-    k_ll: NDArray[np.float64]
-    k_ln: NDArray[np.float64]
-    k_nl: NDArray[np.float64]
-    k_nn: NDArray[np.float64]
+    k_ll: sparse.csc_matrix
+    k_ln: sparse.csc_matrix
+    k_nl: sparse.csc_matrix
+    k_nn: sparse.csc_matrix
     f_l: NDArray[np.float64]
     f_n: NDArray[np.float64]
 
@@ -189,22 +191,26 @@ class CondensedContinuationSolver:
         blocks = _evaluate_parameter_blocks(prepared, parameter)
         derivative_blocks = _evaluate_parameter_blocks(prepared, parameter, derivative=True)
 
-        lu = lu_factor(blocks.k_ll)
-        linear_force_solution = lu_solve(lu, blocks.f_l)
-        linear_coupling_solution = lu_solve(lu, blocks.k_ln)
-        linear_force_derivative_solution = lu_solve(
-            lu,
-            derivative_blocks.f_l - derivative_blocks.k_ll @ linear_force_solution,
-        )
-        linear_coupling_derivative_solution = lu_solve(
-            lu,
-            derivative_blocks.k_ln - derivative_blocks.k_ll @ linear_coupling_solution,
-        )
+        lu = splu(blocks.k_ll, permc_spec="COLAMD")
+        linear_rhs = np.column_stack((blocks.f_l, blocks.k_ln.toarray()))
+        linear_solution = lu.solve(linear_rhs)
+        linear_force_solution = linear_solution[:, 0]
+        linear_coupling_solution = linear_solution[:, 1:]
 
-        condensed_linear_raw = blocks.k_nn - blocks.k_nl @ linear_coupling_solution
+        derivative_rhs = np.column_stack(
+            (
+                derivative_blocks.f_l - derivative_blocks.k_ll @ linear_force_solution,
+                derivative_blocks.k_ln.toarray() - derivative_blocks.k_ll @ linear_coupling_solution,
+            )
+        )
+        derivative_solution = lu.solve(derivative_rhs)
+        linear_force_derivative_solution = derivative_solution[:, 0]
+        linear_coupling_derivative_solution = derivative_solution[:, 1:]
+
+        condensed_linear_raw = blocks.k_nn.toarray() - blocks.k_nl @ linear_coupling_solution
         condensed_force_raw = blocks.f_n - blocks.k_nl @ linear_force_solution
         condensed_linear_derivative = (
-            derivative_blocks.k_nn
+            derivative_blocks.k_nn.toarray()
             - derivative_blocks.k_nl @ linear_coupling_solution
             - blocks.k_nl @ linear_coupling_derivative_solution
         )
@@ -613,10 +619,10 @@ def _prepare_structured_parameter_blocks(
     linear_indices: NDArray[np.int64],
     nonlinear_indices: NDArray[np.int64],
 ) -> tuple[
-    dict[float, NDArray[np.float64]],
-    dict[float, NDArray[np.float64]],
-    dict[float, NDArray[np.float64]],
-    dict[float, NDArray[np.float64]],
+    dict[float, sparse.csc_matrix],
+    dict[float, sparse.csc_matrix],
+    dict[float, sparse.csc_matrix],
+    dict[float, sparse.csc_matrix],
     dict[float, NDArray[np.float64]],
     dict[float, NDArray[np.float64]],
 ]:
@@ -629,11 +635,11 @@ def _prepare_structured_parameter_blocks(
 
     mass_basis, damping_basis, stiffness_basis = harmonic_integral_matrices(context.harmonics)
     basis_by_type = {
-        "ddx": mass_basis,
-        "dx": damping_basis,
-        "x": stiffness_basis,
+        "ddx": sparse.csc_matrix(mass_basis),
+        "dx": sparse.csc_matrix(damping_basis),
+        "x": sparse.csc_matrix(stiffness_basis),
     }
-    operator_blocks: dict[float, NDArray[np.float64]] = {}
+    operator_blocks: dict[float, sparse.csc_matrix] = {}
     linear_terms = tuple(linear_terms_method())
     if not linear_terms:
         raise ValueError("model.linear_operator_terms() must return at least one term")
@@ -641,13 +647,13 @@ def _prepare_structured_parameter_blocks(
         basis_type = term.basis_type
         if basis_type not in basis_by_type:
             raise ValueError(f"unsupported linear operator basis_type: {basis_type!r}")
-        matrix = np.asarray(term.matrix, dtype=np.float64)
+        matrix = sparse.csc_matrix(term.matrix, dtype=np.float64)
         expected_matrix_shape = (model.n_dof, model.n_dof)
         if matrix.shape != expected_matrix_shape:
             raise ValueError(f"linear operator matrix must have shape {expected_matrix_shape}, got {matrix.shape}")
         power = _validated_parameter_power(term.parameter_power)
-        block = np.kron(matrix, basis_by_type[basis_type])
-        _add_powered_block(operator_blocks, power, block)
+        block = sparse.kron(matrix, basis_by_type[basis_type], format="csc")
+        _add_powered_sparse_block(operator_blocks, power, block)
 
     forcing_blocks: dict[float, NDArray[np.float64]] = {}
     forcing_terms = tuple(forcing_terms_method(t))
@@ -665,7 +671,7 @@ def _prepare_structured_parameter_blocks(
             sample_fft,
             context.harmonic_indices,
         )
-        _add_powered_block(forcing_blocks, power, coefficients)
+        _add_powered_dense_block(forcing_blocks, power, coefficients)
 
     return (
         _slice_powered_matrix_blocks(operator_blocks, linear_indices, linear_indices),
@@ -684,7 +690,18 @@ def _validated_parameter_power(power: float) -> float:
     return value
 
 
-def _add_powered_block(
+def _add_powered_sparse_block(
+    blocks: dict[float, sparse.csc_matrix],
+    power: float,
+    block: sparse.csc_matrix,
+) -> None:
+    if power in blocks:
+        blocks[power] = (blocks[power] + block).tocsc()
+    else:
+        blocks[power] = block
+
+
+def _add_powered_dense_block(
     blocks: dict[float, NDArray[np.float64]],
     power: float,
     block: NDArray[np.float64],
@@ -696,11 +713,11 @@ def _add_powered_block(
 
 
 def _slice_powered_matrix_blocks(
-    blocks: dict[float, NDArray[np.float64]],
+    blocks: dict[float, sparse.csc_matrix],
     row_indices: NDArray[np.int64],
     col_indices: NDArray[np.int64],
-) -> dict[float, NDArray[np.float64]]:
-    return {power: block[np.ix_(row_indices, col_indices)] for power, block in blocks.items()}
+) -> dict[float, sparse.csc_matrix]:
+    return {power: block[row_indices, :][:, col_indices].tocsc() for power, block in blocks.items()}
 
 
 def _slice_powered_vector_blocks(
@@ -717,16 +734,37 @@ def _evaluate_parameter_blocks(
     derivative: bool = False,
 ) -> _ParameterBlockSet:
     return _ParameterBlockSet(
-        k_ll=_combine_powered_blocks(prepared.operator_ll_blocks, parameter, derivative=derivative),
-        k_ln=_combine_powered_blocks(prepared.operator_ln_blocks, parameter, derivative=derivative),
-        k_nl=_combine_powered_blocks(prepared.operator_nl_blocks, parameter, derivative=derivative),
-        k_nn=_combine_powered_blocks(prepared.operator_nn_blocks, parameter, derivative=derivative),
-        f_l=_combine_powered_blocks(prepared.forcing_l_blocks, parameter, derivative=derivative),
-        f_n=_combine_powered_blocks(prepared.forcing_n_blocks, parameter, derivative=derivative),
+        k_ll=_combine_powered_sparse_blocks(prepared.operator_ll_blocks, parameter, derivative=derivative),
+        k_ln=_combine_powered_sparse_blocks(prepared.operator_ln_blocks, parameter, derivative=derivative),
+        k_nl=_combine_powered_sparse_blocks(prepared.operator_nl_blocks, parameter, derivative=derivative),
+        k_nn=_combine_powered_sparse_blocks(prepared.operator_nn_blocks, parameter, derivative=derivative),
+        f_l=_combine_powered_dense_blocks(prepared.forcing_l_blocks, parameter, derivative=derivative),
+        f_n=_combine_powered_dense_blocks(prepared.forcing_n_blocks, parameter, derivative=derivative),
     )
 
 
-def _combine_powered_blocks(
+def _combine_powered_sparse_blocks(
+    blocks: dict[float, sparse.csc_matrix],
+    parameter: float,
+    *,
+    derivative: bool = False,
+) -> sparse.csc_matrix:
+    if not blocks:
+        raise ValueError("at least one parameter block is required")
+    active_parameter = float(parameter)
+    result: sparse.csc_matrix | None = None
+    for power, block in blocks.items():
+        scale = _parameter_derivative_scale(active_parameter, power) if derivative else active_parameter**power
+        if scale == 0.0:
+            continue
+        contribution = block * scale
+        result = contribution if result is None else result + contribution
+    if result is None:
+        return sparse.csc_matrix(next(iter(blocks.values())).shape, dtype=np.float64)
+    return result.tocsc()
+
+
+def _combine_powered_dense_blocks(
     blocks: dict[float, NDArray[np.float64]],
     parameter: float,
     *,
