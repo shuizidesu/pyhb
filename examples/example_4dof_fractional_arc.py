@@ -18,7 +18,7 @@ from ega_ihb import (
     ContinuationSolver,
     ForcingTerm,
     LinearOperatorTerm,
-    NonlinearJacobianTerm,
+    LocalNonlinearJacobianTerm,
     SecondOrderTimeModel,
     build_quadratic_nonlinear_harmonics,
 )
@@ -141,6 +141,14 @@ class FourDofFractionalModel(SecondOrderTimeModel):
     def n_dof(self) -> int:
         return self.system.n_dof
 
+    @property
+    def nonlinear_force_dofs(self) -> tuple[int, int]:
+        return (0, 1)
+
+    @property
+    def nonlinear_coordinate_dofs(self) -> tuple[int, int]:
+        return (0, 1)
+
     def linear_operator_terms(self) -> tuple[LinearOperatorTerm, ...]:
         return (
             LinearOperatorTerm(self.system.mass, "ddx", 0.0),
@@ -158,45 +166,39 @@ class FourDofFractionalModel(SecondOrderTimeModel):
         force[:, 1] += fractional_force
         return (ForcingTerm(force, 0.0),)
 
-    def nonlinear_force(
+    def local_nonlinear_force(
         self,
         t: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
-        nonlinear = np.zeros((x.shape[0], self.n_dof), dtype=np.float64)
-        nonlinear[:, 0] = (self.system.nonlinear_scale / parameter**2) * x[:, 0] ** 3
-        nonlinear[:, 1] = (self.system.nonlinear_scale / parameter**2) * x[:, 1] ** 3
-        return nonlinear
+        return (self.system.nonlinear_scale / parameter**2) * local_x**3
 
-    def nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian_terms(
         self,
         t: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[NonlinearJacobianTerm, ...]:
+    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
         factor = 3.0 * self.system.nonlinear_scale / parameter**2
         return (
-            NonlinearJacobianTerm(0, "x", 0, factor * x[:, 0] ** 2),
-            NonlinearJacobianTerm(1, "x", 1, factor * x[:, 1] ** 2),
+            LocalNonlinearJacobianTerm(0, "x", 0, factor * local_x[:, 0] ** 2),
+            LocalNonlinearJacobianTerm(1, "x", 1, factor * local_x[:, 1] ** 2),
         )
 
-    def nonlinear_parameter_derivative(
+    def local_nonlinear_parameter_derivative(
         self,
         t: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
-        derivative = np.zeros_like(x)
-        derivative[:, 0] = (-2.0 * self.system.nonlinear_scale / parameter**3) * x[:, 0] ** 3
-        derivative[:, 1] = (-2.0 * self.system.nonlinear_scale / parameter**3) * x[:, 1] ** 3
-        return derivative
+        return (-2.0 * self.system.nonlinear_scale / parameter**3) * local_x**3
 
 
 def parse_args() -> argparse.Namespace:

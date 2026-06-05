@@ -12,7 +12,7 @@ from scipy.integrate import solve_ivp
 from scipy.linalg import null_space
 
 from .harmonics import coefficient_matrix_from_fft, flatten_coefficients, generate_hb_items, stack_fft_coefficients, unflatten_coefficients
-from .hb_operators import HBContext, harmonic_integral_matrices
+from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics, harmonic_integral_matrices
 from .models import SecondOrderTimeModel
 
 
@@ -20,7 +20,7 @@ from .models import SecondOrderTimeModel
 class ContinuationConfig:
     sample_fft: int = 2**11
     harmonics: tuple[float, ...] = tuple(float(v) for v in range(1, 11))
-    nonlinear_harmonics: tuple[float, ...] = tuple(float(v) for v in range(1, 21))
+    nonlinear_harmonics: tuple[float, ...] | None = None
     frequency_resolution: float = 1.0
     frequency_tolerance: float = 1e-10
     strict_fft_grid: bool | None = None
@@ -106,9 +106,13 @@ class ContinuationSolver:
 
     def _prepare(self) -> _PreparedProblem:
         config = self.config
+        active_nonlinear_harmonics = config.nonlinear_harmonics or build_full_fft_nonlinear_harmonics(
+            config.sample_fft,
+            config.frequency_resolution,
+        )
         context = HBContext.build(
             config.harmonics,
-            config.nonlinear_harmonics,
+            active_nonlinear_harmonics,
             config.sample_fft,
             config.frequency_resolution,
             config.frequency_tolerance,

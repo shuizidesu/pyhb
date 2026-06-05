@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.io import loadmat
 
-from ega_ihb import CondensedSecondOrderTimeModel, ForcingTerm, LinearOperatorTerm
+from ega_ihb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
 
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"
@@ -31,7 +31,7 @@ class AeroEngineParameters:
     bearing_kb: float = 2.5e8
 
 
-class AeroEngineRotorModel(CondensedSecondOrderTimeModel):
+class AeroEngineRotorModel(SecondOrderTimeModel):
     def __init__(
         self,
         matrix_path: str | Path = DEFAULT_MATRIX_PATH,
@@ -87,6 +87,10 @@ class AeroEngineRotorModel(CondensedSecondOrderTimeModel):
     def nonlinear_coordinate_dofs(self) -> tuple[int, int, int, int]:
         return (self.bearing_ix, self.bearing_ox, self.bearing_iy, self.bearing_oy)
 
+    @property
+    def bearing_nonlinear_dofs(self) -> tuple[int, int, int, int]:
+        return self.nonlinear_coordinate_dofs
+
     def _node_x_indices(self, node_locations: tuple[int, ...]) -> NDArray[np.int64]:
         return np.asarray([2 * location - 2 for location in node_locations], dtype=np.int64)
 
@@ -115,21 +119,38 @@ class AeroEngineRotorModel(CondensedSecondOrderTimeModel):
         force[:, self.hp_disk_y] = hp_scale * np.sin(hp_angle)[:, None] * hp_me[None, :]
         return force
 
-    def local_nonlinear_force_and_partials(
+    def local_nonlinear_force(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        fx, fy, partials = self._bearing_force_and_partials_from_local(t, local_x)
+    ) -> NDArray[np.float64]:
+        fx, fy, _ = self._bearing_force_and_partials_from_local(t, local_x)
+        return np.column_stack((fx, -fx, fy, -fy))
+
+    def local_nonlinear_jacobian_terms(
+        self,
+        t: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
+        parameter: float,
+    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+        _, _, partials = self._bearing_force_and_partials_from_local(t, local_x)
         dfx_dx, dfx_dy, dfy_dx, dfy_dy = partials
-        force = np.column_stack((fx, -fx, fy, -fy))
-        jacobian = np.empty((t.size, 4, 4), dtype=np.float64)
-        jacobian[:, 0, :] = np.column_stack((dfx_dx, -dfx_dx, dfx_dy, -dfx_dy))
-        jacobian[:, 1, :] = -jacobian[:, 0, :]
-        jacobian[:, 2, :] = np.column_stack((dfy_dx, -dfy_dx, dfy_dy, -dfy_dy))
-        jacobian[:, 3, :] = -jacobian[:, 2, :]
-        return force, jacobian
+        partial_rows = (
+            (dfx_dx, -dfx_dx, dfx_dy, -dfx_dy),
+            (-dfx_dx, dfx_dx, -dfx_dy, dfx_dy),
+            (dfy_dx, -dfy_dx, dfy_dy, -dfy_dy),
+            (-dfy_dx, dfy_dx, -dfy_dy, dfy_dy),
+        )
+        return tuple(
+            LocalNonlinearJacobianTerm(row, "x", column, values)
+            for row, row_values in enumerate(partial_rows)
+            for column, values in enumerate(row_values)
+        )
 
     def _bearing_force_and_partials_from_local(
         self,

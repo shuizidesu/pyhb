@@ -12,7 +12,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb import CondensedContinuationConfig, CondensedContinuationResult, CondensedContinuationSolver
-from ega_ihb.hb_operators import build_full_fft_nonlinear_harmonics
 from examples.aeroengine_condensed_model import AeroEngineRotorModel
 
 
@@ -48,7 +47,6 @@ def build_config(args: argparse.Namespace, init_omega: float = INIT_OMEGA) -> Co
     return CondensedContinuationConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
-        nonlinear_harmonics=build_full_fft_nonlinear_harmonics(args.sample_fft, FREQUENCY_RESOLUTION),
         frequency_resolution=FREQUENCY_RESOLUTION,
         init_omega=init_omega,
         max_epoch=MAX_EPOCH,
