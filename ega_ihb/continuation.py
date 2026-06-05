@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
-from scipy.integrate import solve_ivp
 from scipy.sparse.linalg import splu
 
 from .harmonics import coefficient_matrix_from_fft, flatten_coefficients, generate_hb_items, stack_fft_coefficients, unflatten_coefficients
@@ -23,7 +22,6 @@ class ContinuationConfig:
     nonlinear_harmonics: tuple[float, ...] | None = None
     frequency_resolution: float = 1.0
     frequency_tolerance: float = 1e-10
-    strict_fft_grid: bool | None = None
     s3_method: str = "fast"
     s3_quadrature_samples: int | None = None
     init_omega: float = 300.0
@@ -37,10 +35,6 @@ class ContinuationConfig:
     omega_scale: float = 1.0
     max_steps: int = 500
     shrink_limit: int = 20
-    plot_dt: float = 0.01
-    enable_ode_check: bool = False
-    ode_periods: int = 400
-    ode_max_step: float | None = None
     progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
 
@@ -56,17 +50,7 @@ class StepLog:
 
 
 @dataclass(frozen=True)
-class OdeCheckResult:
-    t: NDArray[np.float64]
-    y: NDArray[np.float64]
-    hb_t: NDArray[np.float64]
-    hb_x: NDArray[np.float64]
-
-
-@dataclass(frozen=True)
 class ContinuationResult:
-    omega_list: NDArray[np.float64]
-    amplitudes: NDArray[np.float64]
     coefficients: NDArray[np.float64]
     omega: float
     coefficient_history: NDArray[np.float64]
@@ -77,7 +61,6 @@ class ContinuationResult:
     period: float
     logs: list[StepLog] = field(default_factory=list)
     initial_log: StepLog | None = None
-    ode_check: OdeCheckResult | None = None
 
 
 @dataclass
@@ -88,7 +71,6 @@ class _PreparedProblem:
     hb_item: NDArray[np.float64]
     hb_item_dt: NDArray[np.float64]
     hb_item_ddt: NDArray[np.float64]
-    hb_item_plot: NDArray[np.float64]
     operator_blocks: dict[float, sparse.csc_matrix]
     forcing_blocks: dict[float, NDArray[np.float64]]
 
@@ -119,19 +101,11 @@ class ContinuationSolver:
             config.s3_quadrature_samples,
             config.progress_callback,
         )
-        use_strict_grid = self._use_strict_fft_grid(context)
         self._emit_progress(
-            f"Generating HB basis... period={context.period:.12g}, strict_fft_grid={use_strict_grid}, "
-            f"samples={config.sample_fft}"
+            f"Generating HB basis... period={context.period:.12g}, samples={config.sample_fft}"
         )
-        if use_strict_grid:
-            t = np.arange(config.sample_fft, dtype=np.float64) * (context.period / config.sample_fft)
-            t_plot = np.arange(0.0, context.period, config.plot_dt)
-        else:
-            t = np.linspace(0.0, context.period, config.sample_fft)
-            t_plot = np.arange(0.0, context.period + 0.5 * config.plot_dt, config.plot_dt)
+        t = np.arange(config.sample_fft, dtype=np.float64) * (context.period / config.sample_fft)
         hb_item, hb_item_dt, hb_item_ddt = generate_hb_items(t, context.harmonics)
-        hb_item_plot, _, _ = generate_hb_items(t_plot, context.harmonics)
         operator_blocks, forcing_blocks = _prepare_structured_parameter_blocks(
             self.model,
             context,
@@ -145,7 +119,6 @@ class ContinuationSolver:
             hb_item,
             hb_item_dt,
             hb_item_ddt,
-            hb_item_plot,
             operator_blocks,
             forcing_blocks,
         )
@@ -153,12 +126,6 @@ class ContinuationSolver:
     def _emit_progress(self, message: str) -> None:
         if self.config.progress_callback is not None:
             self.config.progress_callback(message)
-
-    def _use_strict_fft_grid(self, context: HBContext) -> bool:
-        if self.config.strict_fft_grid is not None:
-            return bool(self.config.strict_fft_grid)
-        integer_harmonics = all(float(value).is_integer() for value in context.harmonics)
-        return not (np.isclose(context.frequency_resolution, 1.0) and integer_harmonics)
 
     def _evaluate_state(
         self,
@@ -371,27 +338,6 @@ class ContinuationSolver:
             raise np.linalg.LinAlgError("arc tangent has zero weighted norm")
         return vector / norm
 
-    def _run_ode_check(self, coeff: NDArray[np.float64], parameter: float) -> OdeCheckResult:
-        config = self.config
-        t_hb = np.arange(0.0, config.ode_periods * self.prepared.context.period + 0.005, 0.01)
-        hb_item, hb_item_dt, _ = generate_hb_items(t_hb, self.prepared.context.harmonics)
-        hb_x = hb_item @ coeff
-        hb_v = hb_item_dt @ coeff
-        y0 = np.concatenate((hb_x[0, :], hb_v[0, :]))
-        kwargs = {}
-        if config.ode_max_step is not None:
-            kwargs["max_step"] = config.ode_max_step
-        sol = solve_ivp(
-            lambda t, y: self.model.rhs(t, y, parameter),
-            (0.0, config.ode_periods * self.prepared.context.period),
-            y0,
-            method="DOP853",
-            rtol=1e-8,
-            atol=1e-10,
-            **kwargs,
-        )
-        return OdeCheckResult(sol.t, sol.y.T, t_hb, hb_x)
-
     def _run_full(
         self,
         initial_coefficients: NDArray[np.float64] | None = None,
@@ -416,8 +362,7 @@ class ContinuationSolver:
         tangent = self._initial_tangent(jacobian, j_parameter)
         y0 = np.concatenate((coeff_line, np.array([parameter], dtype=np.float64)))
 
-        amplitudes: list[NDArray[np.float64]] = []
-        omega_list: list[float] = []
+        parameter_history: list[float] = []
         coefficient_history: list[NDArray[np.float64]] = []
         logs: list[StepLog] = []
         arc_length_step = float(config.s_initial)
@@ -477,9 +422,7 @@ class ContinuationSolver:
                 tangent_candidate = j_arc_lu.solve(np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0]))))
                 tangent = self._weighted_normalize(tangent_candidate)
                 coeff, _, _, _ = self._evaluate_state(coeff_line)
-                y_plot = self.prepared.hb_item_plot @ coeff
-                amplitudes.append(rms_amplitude(y_plot))
-                omega_list.append(float(parameter))
+                parameter_history.append(float(parameter))
                 coefficient_history.append(coeff.copy())
                 shrink_count = 0
             else:
@@ -495,32 +438,23 @@ class ContinuationSolver:
 
         final_coeff, _, _, _ = self._evaluate_state(y0[:-1])
         final_parameter = float(y0[-1])
-        ode_check = self._run_ode_check(final_coeff, final_parameter) if config.enable_ode_check else None
-        amplitudes_array = (
-            np.asarray(amplitudes, dtype=np.float64)
-            if amplitudes
-            else np.empty((0, self.model.n_dof), dtype=np.float64)
-        )
         coefficient_history_array = (
             np.asarray(coefficient_history, dtype=np.float64)
             if coefficient_history
             else np.empty((0, self.prepared.context.order, self.model.n_dof), dtype=np.float64)
         )
-        parameter_history = np.asarray(omega_list, dtype=np.float64)
+        parameter_history_array = np.asarray(parameter_history, dtype=np.float64)
         return ContinuationResult(
-            omega_list=parameter_history,
-            amplitudes=amplitudes_array,
             coefficients=final_coeff,
             omega=final_parameter,
             coefficient_history=coefficient_history_array,
-            parameter_history=parameter_history,
+            parameter_history=parameter_history_array,
             harmonics=np.asarray(self.prepared.context.harmonics, dtype=np.float64),
             nonlinear_harmonics=np.asarray(self.prepared.context.nonlinear_harmonics, dtype=np.float64),
             frequency_resolution=float(self.prepared.context.frequency_resolution),
             period=float(self.prepared.context.period),
             logs=logs,
             initial_log=initial_log,
-            ode_check=ode_check,
         )
 
     def run(
@@ -531,12 +465,6 @@ class ContinuationSolver:
         """Run initial Newton solve followed by arc-length continuation."""
 
         return self._run_full(initial_coefficients, initial_parameter)
-
-
-def rms_amplitude(samples: NDArray[np.float64]) -> NDArray[np.float64]:
-    centered = samples - np.mean(samples, axis=0, keepdims=True)
-    return np.sqrt(np.mean(centered**2, axis=0))
-
 
 def _validate_positive_scale(name: str, value: float) -> None:
     scale = float(value)

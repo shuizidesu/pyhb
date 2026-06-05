@@ -55,7 +55,6 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
-        strict_fft_grid=True,
         init_omega=INIT_OMEGA,
         max_epoch=MAX_EPOCH,
         res_tolerance=RES_TOLERANCE,
