@@ -12,7 +12,6 @@ from scipy import sparse
 from scipy.linalg import null_space
 from scipy.sparse.linalg import splu
 
-from .continuation import rms_amplitude
 from .harmonics import (
     coefficient_matrix_from_fft,
     flatten_coefficients,
@@ -54,8 +53,6 @@ class CondensedContinuationConfig:
     max_epoch: int = 100
     res_tolerance: float = 5e-9
     delta_tolerance: float = 1e-19
-    seed: int | None = 0
-    initial_scale: float = 1e-4
     s_initial: float = 0.1
     s_max: float = 0.5
     s_min: float = 1e-9
@@ -97,23 +94,12 @@ class CondensedContinuationLoopEvent:
 
 @dataclass(frozen=True)
 class CondensedContinuationResult:
-    omega_list: NDArray[np.float64]
-    amplitudes: NDArray[np.float64]
-    coefficients: NDArray[np.float64]
-    nonlinear_coefficients: NDArray[np.float64]
-    omega: float
+    parameter_history: NDArray[np.float64]
     coefficient_history: NDArray[np.float64]
     nonlinear_coefficient_history: NDArray[np.float64]
-    parameter_history: NDArray[np.float64]
-    harmonics: NDArray[np.float64]
-    nonlinear_harmonics: NDArray[np.float64]
-    frequency_resolution: float
-    period: float
     logs: list[CondensedContinuationLog] = field(default_factory=list)
     loop_events: list[CondensedContinuationLoopEvent] = field(default_factory=list)
     initial_log: CondensedContinuationLog | None = None
-    condensed_dimension: int = 0
-    full_dimension: int = 0
 
 
 @dataclass
@@ -209,19 +195,16 @@ class CondensedContinuationSolver:
         if self.config.progress_callback is not None:
             self.config.progress_callback(message)
 
-    def _initial_nonlinear_vector(self, initial_coefficients: NDArray[np.float64] | None) -> NDArray[np.float64]:
+    def _initial_nonlinear_vector(self, initial_coefficients: NDArray[np.float64]) -> NDArray[np.float64]:
         order = self.prepared.context.order
         nonlinear_count = len(self.prepared.nonlinear_dofs)
-        if initial_coefficients is not None:
-            initial = np.asarray(initial_coefficients, dtype=np.float64)
-            if initial.shape != (order, nonlinear_count):
-                raise ValueError(
-                    "initial_coefficients must have shape "
-                    f"{(order, nonlinear_count)}, got {initial.shape}"
-                )
-            return flatten_coefficients(initial)
-        rng = np.random.default_rng(self.config.seed)
-        return flatten_coefficients(rng.random((order, nonlinear_count), dtype=np.float64) * self.config.initial_scale)
+        initial = np.asarray(initial_coefficients, dtype=np.float64)
+        if initial.shape != (order, nonlinear_count):
+            raise ValueError(
+                "initial_coefficients must have shape "
+                f"{(order, nonlinear_count)}, got {initial.shape}"
+            )
+        return flatten_coefficients(initial)
 
     def _build_linear_state(self, parameter: float) -> _ContinuationLinearState:
         prepared = self.prepared
@@ -268,17 +251,13 @@ class CondensedContinuationSolver:
     def _recover_full_vector(self, nonlinear_vector: NDArray[np.float64], linear_state: _ContinuationLinearState) -> NDArray[np.float64]:
         return _recover_full_vector(nonlinear_vector, self.prepared, linear_state)
 
-    def _evaluate_state(
+    def _recover_full_coefficients(
         self,
         nonlinear_vector: NDArray[np.float64],
         linear_state: _ContinuationLinearState,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    ) -> NDArray[np.float64]:
         full_vector = self._recover_full_vector(nonlinear_vector, linear_state)
-        coefficients = unflatten_coefficients(full_vector, self.prepared.context.order, self.model.n_dof)
-        x = self.prepared.hb_item @ coefficients
-        dx = self.prepared.hb_item_dt @ coefficients
-        ddx = self.prepared.hb_item_ddt @ coefficients
-        return coefficients, x, dx, ddx
+        return unflatten_coefficients(full_vector, self.prepared.context.order, self.model.n_dof)
 
     def _local_nonlinear_values(
         self,
@@ -502,9 +481,17 @@ class CondensedContinuationSolver:
         )
 
     def run(self, initial_coefficients: NDArray[np.float64] | None = None) -> CondensedContinuationResult:
+        if initial_coefficients is None:
+            raise ValueError("CondensedContinuationSolver.run requires explicit initial_coefficients")
         nonlinear_vector = self._initial_nonlinear_vector(initial_coefficients)
         parameter = float(self.config.init_omega)
         nonlinear_vector, jacobian, linear_state, initial_log = self._solve_initial(nonlinear_vector, parameter)
+        if not initial_log.converged:
+            raise RuntimeError(
+                "initial condensed computation did not converge: "
+                f"epoch={initial_log.epoch}, residual={initial_log.max_residual:.6e}, "
+                f"delta={initial_log.max_delta:.6e}, omega={initial_log.omega:.10g}"
+            )
         self._emit_progress(
             "Initial condensed computation, "
             f"Epoch = {initial_log.epoch}, Res = {initial_log.max_residual:.6e}, "
@@ -517,11 +504,8 @@ class CondensedContinuationSolver:
         )
         tangent = self._initial_tangent(jacobian, parameter_column)
         y0 = np.concatenate((nonlinear_vector, np.array([parameter], dtype=np.float64)))
-        last_linear_state = linear_state
-        last_linear_state_parameter = parameter
 
-        amplitudes: list[NDArray[np.float64]] = []
-        omega_list: list[float] = []
+        parameter_history: list[float] = []
         coefficient_history: list[NDArray[np.float64]] = []
         nonlinear_coefficient_history: list[NDArray[np.float64]] = []
         accepted_nonlinear_vectors: list[NDArray[np.float64]] = []
@@ -592,16 +576,13 @@ class CondensedContinuationSolver:
                 nonlinear_vector = y0[:-1].copy()
                 parameter = float(y0[-1])
                 linear_state = self._build_linear_state(parameter)
-                last_linear_state = linear_state
-                last_linear_state_parameter = parameter
-                coefficients, x, _, _ = self._evaluate_state(nonlinear_vector, linear_state)
+                coefficients = self._recover_full_coefficients(nonlinear_vector, linear_state)
                 nonlinear_coefficients = unflatten_coefficients(
                     nonlinear_vector,
                     self.prepared.context.order,
                     len(self.prepared.nonlinear_dofs),
                 )
-                amplitudes.append(rms_amplitude(x))
-                omega_list.append(float(parameter))
+                parameter_history.append(float(parameter))
                 coefficient_history.append(coefficients.copy())
                 nonlinear_coefficient_history.append(nonlinear_coefficients.copy())
                 accepted_nonlinear_vectors.append(nonlinear_vector.copy())
@@ -656,16 +637,13 @@ class CondensedContinuationSolver:
                             )
                             tangent = self._initial_tangent(restart_result.jacobian, parameter_column)
                             y0 = np.concatenate((nonlinear_vector, np.array([parameter], dtype=np.float64)))
-                            last_linear_state = linear_state
-                            last_linear_state_parameter = parameter
-                            coefficients, x, _, _ = self._evaluate_state(nonlinear_vector, linear_state)
+                            coefficients = self._recover_full_coefficients(nonlinear_vector, linear_state)
                             nonlinear_coefficients = unflatten_coefficients(
                                 nonlinear_vector,
                                 self.prepared.context.order,
                                 len(self.prepared.nonlinear_dofs),
                             )
-                            amplitudes.append(rms_amplitude(x))
-                            omega_list.append(float(parameter))
+                            parameter_history.append(float(parameter))
                             coefficient_history.append(coefficients.copy())
                             nonlinear_coefficient_history.append(nonlinear_coefficients.copy())
                             accepted_nonlinear_vectors.append(nonlinear_vector.copy())
@@ -695,23 +673,6 @@ class CondensedContinuationSolver:
             if shrink_count >= self.config.shrink_limit:
                 break
 
-        final_nonlinear_vector = y0[:-1].copy()
-        final_parameter = float(y0[-1])
-        if final_parameter == last_linear_state_parameter:
-            final_linear_state = last_linear_state
-        else:
-            final_linear_state = self._build_linear_state(final_parameter)
-        final_coefficients, final_x, _, _ = self._evaluate_state(final_nonlinear_vector, final_linear_state)
-        final_nonlinear_coefficients = unflatten_coefficients(
-            final_nonlinear_vector,
-            self.prepared.context.order,
-            len(self.prepared.nonlinear_dofs),
-        )
-        amplitudes_array = (
-            np.asarray(amplitudes, dtype=np.float64)
-            if amplitudes
-            else np.empty((0, self.model.n_dof), dtype=np.float64)
-        )
         coefficient_history_array = (
             np.asarray(coefficient_history, dtype=np.float64)
             if coefficient_history
@@ -722,25 +683,14 @@ class CondensedContinuationSolver:
             if nonlinear_coefficient_history
             else np.empty((0, self.prepared.context.order, len(self.prepared.nonlinear_dofs)), dtype=np.float64)
         )
-        parameter_history = np.asarray(omega_list, dtype=np.float64)
+        parameter_history_array = np.asarray(parameter_history, dtype=np.float64)
         return CondensedContinuationResult(
-            omega_list=parameter_history,
-            amplitudes=amplitudes_array,
-            coefficients=final_coefficients,
-            nonlinear_coefficients=final_nonlinear_coefficients,
-            omega=final_parameter,
+            parameter_history=parameter_history_array,
             coefficient_history=coefficient_history_array,
             nonlinear_coefficient_history=nonlinear_history_array,
-            parameter_history=parameter_history,
-            harmonics=np.asarray(self.prepared.context.harmonics, dtype=np.float64),
-            nonlinear_harmonics=np.asarray(self.prepared.context.nonlinear_harmonics, dtype=np.float64),
-            frequency_resolution=float(self.prepared.context.frequency_resolution),
-            period=float(self.prepared.context.period),
             logs=logs,
             loop_events=loop_events,
             initial_log=initial_log,
-            condensed_dimension=final_nonlinear_vector.size,
-            full_dimension=self.model.n_dof * self.prepared.context.order,
         )
 
 

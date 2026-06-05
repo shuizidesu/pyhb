@@ -38,7 +38,6 @@ DEFAULT_MAX_STEPS = 600
 # HARMONICS = (0.2, 0.5, 0.6, 1.0, 1.2, 2.0, 2.2, 2.4)
 FREQUENCY_RESOLUTION = 0.1
 INIT_OMEGA = 145.0
-INITIAL_SCALE = 1e-6
 MAX_EPOCH = 25
 RES_TOLERANCE = 1e-9
 DELTA_TOLERANCE = 1e-12
@@ -258,28 +257,22 @@ class AeroEngineRotorModel:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the condensed aero-engine arc-length continuation example.")
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--sample-fft", type=int, default=DEFAULT_SAMPLE_FFT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--npy-output", type=Path, default=None)
-    parser.add_argument("--plot", action="store_true")
-    parser.add_argument("--save-coeff-history", action="store_true")
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> CondensedContinuationConfig:
+def build_config(args: argparse.Namespace, init_omega: float = INIT_OMEGA) -> CondensedContinuationConfig:
     return CondensedContinuationConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
         nonlinear_harmonics=build_full_fft_nonlinear_harmonics(args.sample_fft, FREQUENCY_RESOLUTION),
         frequency_resolution=FREQUENCY_RESOLUTION,
-        init_omega=INIT_OMEGA,
+        init_omega=init_omega,
         max_epoch=MAX_EPOCH,
         res_tolerance=RES_TOLERANCE,
         delta_tolerance=DELTA_TOLERANCE,
-        seed=args.seed,
-        initial_scale=INITIAL_SCALE,
         s_initial=0.1,
         s_max=0.1,
         s_min=1e-9,
@@ -293,95 +286,41 @@ def build_config(args: argparse.Namespace) -> CondensedContinuationConfig:
     )
 
 
-def default_plot_dofs(model: AeroEngineRotorModel) -> tuple[int, int, int, int]:
-    return (model.bearing_ix, model.bearing_iy, model.bearing_ox, model.bearing_oy)
+def build_default_initial_coefficients(order: int, nonlinear_count: int) -> NDArray[np.float64]:
+    index = np.arange(order * nonlinear_count, dtype=np.float64).reshape(order, nonlinear_count)
+    return (0.5 + 0.5 * np.sin(index + 1.0)) * 1e-6
 
 
-def save_result(
-    result: CondensedContinuationResult,
-    args: argparse.Namespace,
-    plot_dofs: tuple[int, int, int, int],
-) -> None:
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    curve_table = (
-        np.column_stack((result.omega_list, result.amplitudes))
-        if result.omega_list.size
-        else np.empty((0, result.coefficients.shape[1] + 1), dtype=np.float64)
+def extract_initial_from_saved_result(
+    path: str | Path,
+    index: int,
+    nonlinear_dofs: tuple[int, ...],
+) -> tuple[float, NDArray[np.float64]]:
+    with np.load(path) as data:
+        parameter_history = np.asarray(data["parameter_history"], dtype=np.float64)
+        coefficient_history = np.asarray(data["coefficient_history"], dtype=np.float64)
+    return float(parameter_history[index]), coefficient_history[index][:, list(nonlinear_dofs)].copy()
+
+
+def save_result(result: CondensedContinuationResult, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        output,
+        parameter_history=result.parameter_history,
+        coefficient_history=result.coefficient_history,
     )
-    payload = {
-        "omega_list": result.omega_list,
-        "amplitudes": result.amplitudes,
-        "curve_table": curve_table,
-        "coefficients": result.coefficients,
-        "nonlinear_coefficients": result.nonlinear_coefficients,
-        "omega": np.array(result.omega),
-        "harmonics": result.harmonics,
-        "nonlinear_harmonics": result.nonlinear_harmonics,
-        "frequency_resolution": np.array(result.frequency_resolution),
-        "period": np.array(result.period),
-        "q_scale": np.array(Q_SCALE),
-        "omega_scale": np.array(OMEGA_SCALE),
-        "loop_switch_enabled": np.array(LOOP_SWITCH_ENABLED),
-        "condensed_dimension": np.array(result.condensed_dimension),
-        "full_dimension": np.array(result.full_dimension),
-        "plot_dofs": np.asarray(plot_dofs, dtype=np.int64),
-        "log_step": np.asarray([log.step for log in result.logs], dtype=np.int64),
-        "log_epoch": np.asarray([log.epoch for log in result.logs], dtype=np.int64),
-        "log_max_residual": np.asarray([log.max_residual for log in result.logs], dtype=np.float64),
-        "log_max_delta": np.asarray([log.max_delta for log in result.logs], dtype=np.float64),
-        "log_omega": np.asarray([log.omega for log in result.logs], dtype=np.float64),
-        "log_arc_length": np.asarray([log.arc_length for log in result.logs], dtype=np.float64),
-        "log_converged": np.asarray([log.converged for log in result.logs], dtype=np.bool_),
-        "loop_event_step": np.asarray([event.step for event in result.loop_events], dtype=np.int64),
-        "loop_event_current_index": np.asarray([event.current_index for event in result.loop_events], dtype=np.int64),
-        "loop_event_matched_index": np.asarray([event.matched_index for event in result.loop_events], dtype=np.int64),
-        "loop_event_distance": np.asarray([event.distance for event in result.loop_events], dtype=np.float64),
-        "loop_event_anchor_index": np.asarray([event.anchor_index for event in result.loop_events], dtype=np.int64),
-        "loop_event_restart_omega": np.asarray([event.restart_omega for event in result.loop_events], dtype=np.float64),
-        "loop_event_restarted": np.asarray([event.restarted for event in result.loop_events], dtype=np.bool_),
-    }
-    if result.initial_log is not None:
-        payload["initial_epoch"] = np.array(result.initial_log.epoch)
-        payload["initial_max_residual"] = np.array(result.initial_log.max_residual)
-        payload["initial_max_delta"] = np.array(result.initial_log.max_delta)
-        payload["initial_omega"] = np.array(result.initial_log.omega)
-    if args.save_coeff_history:
-        payload["coefficient_history"] = result.coefficient_history
-        payload["nonlinear_coefficient_history"] = result.nonlinear_coefficient_history
-        payload["parameter_history"] = result.parameter_history
-    np.savez(args.output, **payload)
-    print(f"Saved result to {args.output}")
-
-    table_output = args.npy_output or args.output.with_suffix(".npy")
-    table_output.parent.mkdir(parents=True, exist_ok=True)
-    np.save(table_output, curve_table)
-    print(f"Saved curve table to {table_output}")
-
-    if args.plot:
-        save_plot(result, args.output.with_suffix(".png"), plot_dofs)
-
-
-def save_plot(result: CondensedContinuationResult, plot_path: Path, plot_dofs: tuple[int, int, int, int]) -> None:
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots()
-    for dof in plot_dofs:
-        ax.plot(result.omega_list, result.amplitudes[:, dof], label=f"DOF {dof + 1}")
-    ax.set_xlabel("omega")
-    ax.set_ylabel("RMS amplitude")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(plot_path, dpi=160)
-    plt.close(fig)
-    print(f"Saved plot to {plot_path}")
+    print(f"Saved result to {output}")
 
 
 def run_from_args(args: argparse.Namespace) -> None:
     model = AeroEngineRotorModel()
     solver = CondensedContinuationSolver(model, build_config(args), model.bearing_nonlinear_dofs)
-    result = solver.run()
-    save_result(result, args, default_plot_dofs(model))
+    initial_coefficients = build_default_initial_coefficients(
+        solver.prepared.context.order,
+        len(model.bearing_nonlinear_dofs),
+    )
+    result = solver.run(initial_coefficients)
+    save_result(result, args.output)
 
 
 def main() -> None:
