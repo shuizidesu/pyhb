@@ -4,6 +4,7 @@ from .continuation import ContinuationConfig, ContinuationResult, ContinuationSo
 from .condensed_continuation import (
     CondensedContinuationConfig,
     CondensedContinuationLog,
+    CondensedContinuationLoopEvent,
     CondensedContinuationResult,
     CondensedContinuationSolver,
     ForcingTerm,
@@ -15,6 +16,7 @@ from .models import NonlinearJacobianTerm, SecondOrderTimeModel
 __all__ = [
     "CondensedContinuationConfig",
     "CondensedContinuationLog",
+    "CondensedContinuationLoopEvent",
     "CondensedContinuationResult",
     "CondensedContinuationSolver",
     "ContinuationConfig",

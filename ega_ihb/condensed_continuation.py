@@ -24,9 +24,10 @@ from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics, harmoni
 from .models import SecondOrderTimeModel
 
 
-CondensationConvention = Literal["residual", "matlab_drf_hb"]
-ContinuationDirection = Literal["down", "up"]
 LinearBasisType = Literal["ddx", "dx", "x"]
+_LOOP_REVISIT_EXCLUSION_STEPS = 20
+_LOOP_MIN_HISTORY_STEPS = 50
+_LOOP_RESTART_RECENT_CANDIDATES = 3
 
 
 @dataclass(frozen=True)
@@ -55,13 +56,16 @@ class CondensedContinuationConfig:
     delta_tolerance: float = 1e-19
     seed: int | None = 0
     initial_scale: float = 1e-4
-    condensation_convention: CondensationConvention = "residual"
-    direction: ContinuationDirection = "up"
     s_initial: float = 0.1
     s_max: float = 0.5
     s_min: float = 1e-9
     q_scale: float = 1.0
     omega_scale: float = 1.0
+    loop_switch_enabled: bool = False
+    loop_revisit_tolerance: float = 0.05
+    loop_restart_omega_delta: float = 0.1
+    loop_restart_min_delta: float = 1e-4
+    loop_restart_shrink_limit: int = 8
     max_steps: int = 500
     shrink_limit: int = 20
     s3_method: str = "fast"
@@ -81,6 +85,17 @@ class CondensedContinuationLog:
 
 
 @dataclass(frozen=True)
+class CondensedContinuationLoopEvent:
+    step: int
+    current_index: int
+    matched_index: int
+    distance: float
+    anchor_index: int
+    restart_omega: float
+    restarted: bool
+
+
+@dataclass(frozen=True)
 class CondensedContinuationResult:
     omega_list: NDArray[np.float64]
     amplitudes: NDArray[np.float64]
@@ -95,6 +110,7 @@ class CondensedContinuationResult:
     frequency_resolution: float
     period: float
     logs: list[CondensedContinuationLog] = field(default_factory=list)
+    loop_events: list[CondensedContinuationLoopEvent] = field(default_factory=list)
     initial_log: CondensedContinuationLog | None = None
     condensed_dimension: int = 0
     full_dimension: int = 0
@@ -137,7 +153,16 @@ class _ContinuationLinearState:
     condensed_force_derivative: NDArray[np.float64]
     linear_force_solution: NDArray[np.float64]
     linear_coupling_solution: NDArray[np.float64]
-    linear_recovery_sign: float
+
+
+@dataclass
+class _LoopRestartResult:
+    anchor_index: int
+    restart_omega: float
+    restarted: bool
+    nonlinear_vector: NDArray[np.float64] | None = None
+    jacobian: NDArray[np.float64] | None = None
+    linear_state: _ContinuationLinearState | None = None
 
 
 class CondensedContinuationSolver:
@@ -155,6 +180,18 @@ class CondensedContinuationSolver:
         self.config = config or CondensedContinuationConfig()
         _validate_positive_scale("q_scale", self.config.q_scale)
         _validate_positive_scale("omega_scale", self.config.omega_scale)
+        _validate_positive_scale("loop_restart_omega_delta", self.config.loop_restart_omega_delta)
+        _validate_positive_scale("loop_restart_min_delta", self.config.loop_restart_min_delta)
+        if self.config.loop_revisit_tolerance <= 0.0 or not np.isfinite(self.config.loop_revisit_tolerance):
+            raise ValueError(
+                "loop_revisit_tolerance must be a positive finite value, "
+                f"got {self.config.loop_revisit_tolerance!r}"
+            )
+        if self.config.loop_restart_shrink_limit < 1:
+            raise ValueError(
+                "loop_restart_shrink_limit must be at least 1, "
+                f"got {self.config.loop_restart_shrink_limit!r}"
+            )
         self.prepared = _prepare_condensed_problem(
             self.model,
             tuple(int(dof) for dof in nonlinear_dofs),
@@ -219,22 +256,13 @@ class CondensedContinuationSolver:
             - derivative_blocks.k_nl @ linear_force_solution
             - blocks.k_nl @ linear_force_derivative_solution
         )
-        condensed_force, linear_recovery_sign = _apply_condensation_convention(
-            condensed_force_raw,
-            self.config.condensation_convention,
-        )
-        if self.config.condensation_convention == "matlab_drf_hb":
-            condensed_force_derivative = -condensed_force_derivative_raw
-        else:
-            condensed_force_derivative = condensed_force_derivative_raw
         return _ContinuationLinearState(
             condensed_linear=condensed_linear_raw,
-            condensed_force=condensed_force,
+            condensed_force=condensed_force_raw,
             condensed_linear_derivative=condensed_linear_derivative,
-            condensed_force_derivative=condensed_force_derivative,
+            condensed_force_derivative=condensed_force_derivative_raw,
             linear_force_solution=linear_force_solution,
             linear_coupling_solution=linear_coupling_solution,
-            linear_recovery_sign=linear_recovery_sign,
         )
 
     def _recover_full_vector(self, nonlinear_vector: NDArray[np.float64], linear_state: _ContinuationLinearState) -> NDArray[np.float64]:
@@ -343,9 +371,7 @@ class CondensedContinuationSolver:
 
     def _orient_initial_tangent(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
         oriented = np.asarray(tangent, dtype=np.float64)
-        if self.config.direction == "down" and oriented[-1] > 0.0:
-            oriented = -oriented
-        elif self.config.direction == "up" and oriented[-1] < 0.0:
+        if oriented[-1] < 0.0:
             oriented = -oriented
         return self._weighted_normalize(oriented)
 
@@ -376,6 +402,105 @@ class CondensedContinuationSolver:
             raise np.linalg.LinAlgError("arc tangent has zero weighted norm")
         return vector / norm
 
+    def _scaled_state(
+        self,
+        nonlinear_vector: NDArray[np.float64],
+        parameter: float,
+    ) -> NDArray[np.float64]:
+        return np.concatenate(
+            (
+                nonlinear_vector / float(self.config.q_scale),
+                np.array([float(parameter) / float(self.config.omega_scale)], dtype=np.float64),
+            )
+        )
+
+    def _minimum_history_distance(
+        self,
+        nonlinear_vector: NDArray[np.float64],
+        parameter: float,
+        accepted_nonlinear_vectors: Sequence[NDArray[np.float64]],
+        accepted_parameters: Sequence[float],
+    ) -> float:
+        if not accepted_parameters:
+            return np.inf
+        current = self._scaled_state(nonlinear_vector, parameter)
+        distances = [
+            np.linalg.norm(current - self._scaled_state(history_vector, history_parameter))
+            for history_vector, history_parameter in zip(accepted_nonlinear_vectors, accepted_parameters)
+        ]
+        return float(np.min(distances))
+
+    def _find_loop_revisit(
+        self,
+        nonlinear_vector: NDArray[np.float64],
+        parameter: float,
+        accepted_nonlinear_vectors: Sequence[NDArray[np.float64]],
+        accepted_parameters: Sequence[float],
+    ) -> tuple[int, float] | None:
+        history_count = len(accepted_parameters)
+        if history_count < _LOOP_MIN_HISTORY_STEPS:
+            return None
+        search_count = history_count - _LOOP_REVISIT_EXCLUSION_STEPS
+        if search_count <= 0:
+            return None
+        current = self._scaled_state(nonlinear_vector, parameter)
+        distances = np.asarray(
+            [
+                np.linalg.norm(current - self._scaled_state(history_vector, history_parameter))
+                for history_vector, history_parameter in zip(
+                    accepted_nonlinear_vectors[:search_count],
+                    accepted_parameters[:search_count],
+                )
+            ],
+            dtype=np.float64,
+        )
+        matched_index = int(np.argmin(distances))
+        distance = float(distances[matched_index])
+        if distance <= self.config.loop_revisit_tolerance:
+            return matched_index, distance
+        return None
+
+    def _try_loop_restart_from_recent_history(
+        self,
+        accepted_nonlinear_vectors: Sequence[NDArray[np.float64]],
+        accepted_parameters: Sequence[float],
+    ) -> _LoopRestartResult:
+        if not accepted_parameters:
+            raise ValueError("cannot restart without accepted parameters")
+        parameter_array = np.asarray(accepted_parameters, dtype=np.float64)
+        base_parameter = float(np.max(parameter_array))
+        first_candidate = max(0, len(accepted_parameters) - _LOOP_RESTART_RECENT_CANDIDATES)
+        candidate_indices = tuple(range(len(accepted_parameters) - 1, first_candidate - 1, -1))
+        omega_delta = float(self.config.loop_restart_omega_delta)
+        restart_omega = base_parameter + omega_delta
+
+        for _ in range(self.config.loop_restart_shrink_limit):
+            if omega_delta < self.config.loop_restart_min_delta:
+                break
+            restart_omega = base_parameter + omega_delta
+            for anchor_index in candidate_indices:
+                anchor_vector = accepted_nonlinear_vectors[anchor_index]
+                restart_vector, restart_jacobian, restart_linear_state, restart_log = self._solve_initial(
+                    anchor_vector.copy(),
+                    restart_omega,
+                )
+                if restart_log.converged:
+                    return _LoopRestartResult(
+                        anchor_index=anchor_index,
+                        restart_omega=float(restart_omega),
+                        restarted=True,
+                        nonlinear_vector=restart_vector,
+                        jacobian=restart_jacobian,
+                        linear_state=restart_linear_state,
+                    )
+            omega_delta *= 0.5
+
+        return _LoopRestartResult(
+            anchor_index=candidate_indices[0],
+            restart_omega=float(restart_omega),
+            restarted=False,
+        )
+
     def run(self, initial_coefficients: NDArray[np.float64] | None = None) -> CondensedContinuationResult:
         nonlinear_vector = self._initial_nonlinear_vector(initial_coefficients)
         parameter = float(self.config.init_omega)
@@ -399,12 +524,17 @@ class CondensedContinuationSolver:
         omega_list: list[float] = []
         coefficient_history: list[NDArray[np.float64]] = []
         nonlinear_coefficient_history: list[NDArray[np.float64]] = []
+        accepted_nonlinear_vectors: list[NDArray[np.float64]] = []
+        accepted_parameters: list[float] = []
         logs: list[CondensedContinuationLog] = []
+        loop_events: list[CondensedContinuationLoopEvent] = []
         arc_length_step = float(self.config.s_initial)
         shrink_count = 0
         j_arc_v = None
 
         for step in range(1, self.config.max_steps + 1):
+            loop_restarted = False
+            stop_after_loop_event = False
             y = y0 + arc_length_step * tangent
             nonlinear_vector = y[:-1].copy()
             parameter = float(y[-1])
@@ -474,11 +604,90 @@ class CondensedContinuationSolver:
                 omega_list.append(float(parameter))
                 coefficient_history.append(coefficients.copy())
                 nonlinear_coefficient_history.append(nonlinear_coefficients.copy())
+                accepted_nonlinear_vectors.append(nonlinear_vector.copy())
+                accepted_parameters.append(float(parameter))
                 shrink_count = 0
+                if self.config.loop_switch_enabled:
+                    revisit = self._find_loop_revisit(
+                        nonlinear_vector,
+                        parameter,
+                        accepted_nonlinear_vectors,
+                        accepted_parameters,
+                    )
+                    if revisit is not None:
+                        matched_index, distance = revisit
+                        restart_result = self._try_loop_restart_from_recent_history(
+                            accepted_nonlinear_vectors,
+                            accepted_parameters,
+                        )
+                        loop_event = CondensedContinuationLoopEvent(
+                            step=step,
+                            current_index=len(accepted_parameters) - 1,
+                            matched_index=matched_index,
+                            distance=distance,
+                            anchor_index=restart_result.anchor_index,
+                            restart_omega=restart_result.restart_omega,
+                            restarted=restart_result.restarted,
+                        )
+                        loop_events.append(loop_event)
+                        if not restart_result.restarted:
+                            self._emit_progress(
+                                "Loop revisit detected, "
+                                f"step = {loop_event.step}, matched = {loop_event.matched_index}, "
+                                f"distance = {loop_event.distance:.6e}, "
+                                f"anchor = {loop_event.anchor_index}, "
+                                f"restart_omega = {loop_event.restart_omega:.10g}, restart failed"
+                            )
+                            stop_after_loop_event = True
+                        else:
+                            if (
+                                restart_result.nonlinear_vector is None
+                                or restart_result.jacobian is None
+                                or restart_result.linear_state is None
+                            ):
+                                raise RuntimeError("successful loop restart did not return a complete state")
+                            nonlinear_vector = restart_result.nonlinear_vector.copy()
+                            parameter = float(restart_result.restart_omega)
+                            linear_state = restart_result.linear_state
+                            _, _, parameter_column, linear_state = self._residual_jacobian_with_linear_state(
+                                nonlinear_vector,
+                                parameter,
+                                linear_state,
+                            )
+                            tangent = self._initial_tangent(restart_result.jacobian, parameter_column)
+                            y0 = np.concatenate((nonlinear_vector, np.array([parameter], dtype=np.float64)))
+                            last_linear_state = linear_state
+                            last_linear_state_parameter = parameter
+                            coefficients, x, _, _ = self._evaluate_state(nonlinear_vector, linear_state)
+                            nonlinear_coefficients = unflatten_coefficients(
+                                nonlinear_vector,
+                                self.prepared.context.order,
+                                len(self.prepared.nonlinear_dofs),
+                            )
+                            amplitudes.append(rms_amplitude(x))
+                            omega_list.append(float(parameter))
+                            coefficient_history.append(coefficients.copy())
+                            nonlinear_coefficient_history.append(nonlinear_coefficients.copy())
+                            accepted_nonlinear_vectors.append(nonlinear_vector.copy())
+                            accepted_parameters.append(float(parameter))
+                            loop_restarted = True
+                            shrink_count = 0
+                            self._emit_progress(
+                                "Loop revisit detected, "
+                                f"step = {loop_event.step}, matched = {loop_event.matched_index}, "
+                                f"distance = {loop_event.distance:.6e}, "
+                                f"anchor = {loop_event.anchor_index}, "
+                                f"restart_omega = {loop_event.restart_omega:.10g}, restarted"
+                            )
             else:
                 shrink_count += 1
 
-            if epoch >= self.config.max_epoch:
+            if stop_after_loop_event:
+                break
+
+            if loop_restarted:
+                arc_length_step = float(self.config.s_initial)
+            elif epoch >= self.config.max_epoch:
                 arc_length_step = max(0.5 * arc_length_step, self.config.s_min)
             else:
                 arc_length_step = min(2.0 * arc_length_step, self.config.s_max)
@@ -528,6 +737,7 @@ class CondensedContinuationSolver:
             frequency_resolution=float(self.prepared.context.frequency_resolution),
             period=float(self.prepared.context.period),
             logs=logs,
+            loop_events=loop_events,
             initial_log=initial_log,
             condensed_dimension=final_nonlinear_vector.size,
             full_dimension=self.model.n_dof * self.prepared.context.order,
@@ -798,17 +1008,6 @@ def _coefficient_indices(dofs: Sequence[int], order: int) -> NDArray[np.int64]:
     return np.concatenate([int(dof) * order + offsets for dof in dofs]).astype(np.int64)
 
 
-def _apply_condensation_convention(
-    force_condensation: NDArray[np.float64],
-    convention: CondensationConvention,
-) -> tuple[NDArray[np.float64], float]:
-    if convention == "residual":
-        return force_condensation, -1.0
-    if convention == "matlab_drf_hb":
-        return -force_condensation, 1.0
-    raise ValueError(f"unsupported condensation_convention: {convention!r}")
-
-
 def _recover_full_vector(
     nonlinear_vector: NDArray[np.float64],
     prepared: _PreparedCondensedProblem,
@@ -816,10 +1015,7 @@ def _recover_full_vector(
 ) -> NDArray[np.float64]:
     full = np.zeros(prepared.context.order * (len(prepared.nonlinear_dofs) + len(prepared.linear_dofs)), dtype=np.float64)
     full[prepared.nonlinear_indices] = nonlinear_vector
-    full[prepared.linear_indices] = (
-        linear_state.linear_force_solution
-        + linear_state.linear_recovery_sign * linear_state.linear_coupling_solution @ nonlinear_vector
-    )
+    full[prepared.linear_indices] = linear_state.linear_force_solution - linear_state.linear_coupling_solution @ nonlinear_vector
     return full
 
 

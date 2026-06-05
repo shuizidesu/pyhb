@@ -33,17 +33,18 @@ HARMONICS = harmonic_range(0.5, 3.1, 0.1)
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"
 DEFAULT_OUTPUT = Path("results/example_aeroengine_condensed_arc.npz")
-DEFAULT_SAMPLE_FFT = 2 ** 10
-DEFAULT_MAX_STEPS = 450
+DEFAULT_SAMPLE_FFT = 2 ** 11
+DEFAULT_MAX_STEPS = 600
 # HARMONICS = (0.2, 0.5, 0.6, 1.0, 1.2, 2.0, 2.2, 2.4)
 FREQUENCY_RESOLUTION = 0.1
-INIT_OMEGA = 145
-INITIAL_SCALE = 1e-5
-MAX_EPOCH = 50
-RES_TOLERANCE = 5e-9
+INIT_OMEGA = 145.0
+INITIAL_SCALE = 1e-6
+MAX_EPOCH = 25
+RES_TOLERANCE = 1e-9
 DELTA_TOLERANCE = 1e-12
 Q_SCALE = 1e-4
 OMEGA_SCALE = 200
+LOOP_SWITCH_ENABLED = True
 
 
 @dataclass(frozen=True)
@@ -138,7 +139,7 @@ class AeroEngineRotorModel:
         force[:, self.lp_disk_x] = np.cos(t)[:, None] * lp_me[None, :]
         force[:, self.lp_disk_y] = np.sin(t)[:, None] * lp_me[None, :]
 
-        hp_scale = self.speed_ratio**2
+        hp_scale = self.speed_ratio ** 2
         hp_angle = self.speed_ratio * t
         force[:, self.hp_disk_x] = hp_scale * np.cos(hp_angle)[:, None] * hp_me[None, :]
         force[:, self.hp_disk_y] = hp_scale * np.sin(hp_angle)[:, None] * hp_me[None, :]
@@ -279,13 +280,14 @@ def build_config(args: argparse.Namespace) -> CondensedContinuationConfig:
         delta_tolerance=DELTA_TOLERANCE,
         seed=args.seed,
         initial_scale=INITIAL_SCALE,
-        condensation_convention="matlab_drf_hb",
-        direction="up",
         s_initial=0.1,
         s_max=0.1,
         s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
+        loop_switch_enabled=LOOP_SWITCH_ENABLED,
+        loop_revisit_tolerance=0.01,
+        loop_restart_omega_delta=0.5,
         max_steps=args.max_steps,
         progress_callback=print,
     )
@@ -319,6 +321,7 @@ def save_result(
         "period": np.array(result.period),
         "q_scale": np.array(Q_SCALE),
         "omega_scale": np.array(OMEGA_SCALE),
+        "loop_switch_enabled": np.array(LOOP_SWITCH_ENABLED),
         "condensed_dimension": np.array(result.condensed_dimension),
         "full_dimension": np.array(result.full_dimension),
         "plot_dofs": np.asarray(plot_dofs, dtype=np.int64),
@@ -329,6 +332,13 @@ def save_result(
         "log_omega": np.asarray([log.omega for log in result.logs], dtype=np.float64),
         "log_arc_length": np.asarray([log.arc_length for log in result.logs], dtype=np.float64),
         "log_converged": np.asarray([log.converged for log in result.logs], dtype=np.bool_),
+        "loop_event_step": np.asarray([event.step for event in result.loop_events], dtype=np.int64),
+        "loop_event_current_index": np.asarray([event.current_index for event in result.loop_events], dtype=np.int64),
+        "loop_event_matched_index": np.asarray([event.matched_index for event in result.loop_events], dtype=np.int64),
+        "loop_event_distance": np.asarray([event.distance for event in result.loop_events], dtype=np.float64),
+        "loop_event_anchor_index": np.asarray([event.anchor_index for event in result.loop_events], dtype=np.int64),
+        "loop_event_restart_omega": np.asarray([event.restart_omega for event in result.loop_events], dtype=np.float64),
+        "loop_event_restarted": np.asarray([event.restarted for event in result.loop_events], dtype=np.bool_),
     }
     if result.initial_log is not None:
         payload["initial_epoch"] = np.array(result.initial_log.epoch)
