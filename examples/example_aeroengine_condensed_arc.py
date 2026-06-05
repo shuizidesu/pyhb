@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb import CondensedContinuationConfig, CondensedContinuationResult, CondensedContinuationSolver
-from examples.aeroengine_condensed_model import AeroEngineRotorModel
+from examples.aeroengine_model import AeroEngineRotorModel
 
 
 def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
