@@ -28,7 +28,7 @@ from ega_ihb import (
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"
 DEFAULT_OUTPUT = Path("results/example_aeroengine_arc.npz")
 DEFAULT_MAX_STEPS = 400
-DEFAULT_SAMPLE_FFT = 2**11
+DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 0.1
 DEFAULT_HARMONIC_PRESET = "condensed_aligned"
 INIT_OMEGA = 145.0
@@ -37,7 +37,7 @@ INITIAL_SCALE = 1e-5
 RES_TOLERANCE = 1e-9
 DELTA_TOLERANCE = 1e-12
 Q_SCALE = 1e-4
-OMEGA_SCALE = 200
+OMEGA_SCALE = 100
 
 
 def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
@@ -46,6 +46,7 @@ def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
 
 
 HARMONICS = harmonic_range(0.5, 3.1, 0.1)
+# HARMONICS = (1.0, 1.2)
 NONLINEAR_HARMONICS = build_full_fft_nonlinear_harmonics(DEFAULT_SAMPLE_FFT, FREQUENCY_RESOLUTION)
 
 
@@ -276,7 +277,7 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
         res_tolerance=RES_TOLERANCE,
         delta_tolerance=DELTA_TOLERANCE,
         s_initial=0.1,
-        s_max=0.1,
+        s_max=0.3,
         s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
