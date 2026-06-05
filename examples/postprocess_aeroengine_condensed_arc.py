@@ -12,19 +12,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb.harmonics import generate_hb_items
+from examples.example_aeroengine_condensed_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
 
 
-def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
-    count = int(round((stop - start) / step)) + 1
-    return tuple(round(start + step * index, 10) for index in range(count))
-
-
-HARMONICS = harmonic_range(0.5, 3.1, 0.1)
-FREQUENCY_RESOLUTION = 0.1
 DEFAULT_INPUT = Path("results/example_aeroengine_condensed_arc.npz")
 DEFAULT_OUTPUT = Path("results/example_aeroengine_condensed_arc.png")
 DEFAULT_SAMPLE_COUNT = 4096
-DEFAULT_PLOT_DOFS = (34, 176, 68, 210)
 
 
 def parse_args() -> argparse.Namespace:

@@ -11,7 +11,7 @@ from .condensed_continuation import (
     LinearOperatorTerm,
 )
 from .hb_operators import FrequencyGrid, build_full_fft_nonlinear_harmonics, build_quadratic_nonlinear_harmonics
-from .models import NonlinearJacobianTerm, SecondOrderTimeModel
+from .models import CondensedSecondOrderTimeModel, NonlinearJacobianTerm, SecondOrderTimeModel
 
 __all__ = [
     "CondensedContinuationConfig",
@@ -19,6 +19,7 @@ __all__ = [
     "CondensedContinuationLoopEvent",
     "CondensedContinuationResult",
     "CondensedContinuationSolver",
+    "CondensedSecondOrderTimeModel",
     "ContinuationConfig",
     "ContinuationResult",
     "ContinuationSolver",

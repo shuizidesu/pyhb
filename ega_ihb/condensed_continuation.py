@@ -20,7 +20,7 @@ from .harmonics import (
     unflatten_coefficients,
 )
 from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics, harmonic_integral_matrices
-from .models import SecondOrderTimeModel
+from .models import CondensedSecondOrderTimeModel
 
 
 LinearBasisType = Literal["ddx", "dx", "x"]
@@ -110,8 +110,12 @@ class _PreparedCondensedProblem:
     hb_item_dt: NDArray[np.float64]
     hb_item_ddt: NDArray[np.float64]
     nonlinear_dofs: tuple[int, ...]
+    nonlinear_force_dofs: tuple[int, ...]
+    nonlinear_coordinate_dofs: tuple[int, ...]
     linear_dofs: tuple[int, ...]
     nonlinear_indices: NDArray[np.int64]
+    nonlinear_force_local_indices: NDArray[np.int64]
+    nonlinear_coordinate_local_indices: NDArray[np.int64]
     linear_indices: NDArray[np.int64]
     operator_ll_blocks: dict[float, sparse.csc_matrix]
     operator_ln_blocks: dict[float, sparse.csc_matrix]
@@ -156,12 +160,9 @@ class CondensedContinuationSolver:
 
     def __init__(
         self,
-        model: SecondOrderTimeModel,
+        model: CondensedSecondOrderTimeModel,
         config: CondensedContinuationConfig | None = None,
-        nonlinear_dofs: Sequence[int] = (),
     ) -> None:
-        if not nonlinear_dofs:
-            raise ValueError("nonlinear_dofs must contain at least one DOF")
         self.model = model
         self.config = config or CondensedContinuationConfig()
         _validate_positive_scale("q_scale", self.config.q_scale)
@@ -180,7 +181,6 @@ class CondensedContinuationSolver:
             )
         self.prepared = _prepare_condensed_problem(
             self.model,
-            tuple(int(dof) for dof in nonlinear_dofs),
             harmonics=self.config.harmonics,
             nonlinear_harmonics=self.config.nonlinear_harmonics,
             sample_fft=self.config.sample_fft,
@@ -268,21 +268,25 @@ class CondensedContinuationSolver:
         if local_method is None:
             raise ValueError("CondensedContinuationSolver requires model.local_nonlinear_force_and_partials(...)")
         force, partials = local_method(self.prepared.t, local_x, parameter)
-        return _validate_local_force_and_partials(force, partials, self.prepared, len(self.prepared.nonlinear_dofs))
+        return _validate_local_force_and_partials(force, partials, self.prepared)
 
     def _local_nonlinear_parameter_coefficients(
         self,
         local_x: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
-        local_parameter_method = getattr(self.model, "local_nonlinear_parameter_derivative", None)
-        if local_parameter_method is None:
-            return np.zeros(len(self.prepared.nonlinear_indices), dtype=np.float64)
-        samples = np.asarray(local_parameter_method(self.prepared.t, local_x, parameter), dtype=np.float64)
-        expected_shape = (self.prepared.t.size, len(self.prepared.nonlinear_dofs))
+        samples = np.asarray(
+            self.model.local_nonlinear_parameter_derivative(self.prepared.t, local_x, parameter),
+            dtype=np.float64,
+        )
+        expected_shape = (self.prepared.t.size, len(self.prepared.nonlinear_force_dofs))
         if samples.shape != expected_shape:
             raise ValueError(f"local nonlinear parameter derivative must have shape {expected_shape}, got {samples.shape}")
-        return _stack_local_coefficients(samples, self.prepared, self.config.sample_fft)
+        return _scatter_local_coefficients(
+            _stack_local_coefficients(samples, self.prepared, self.config.sample_fft),
+            self.prepared.nonlinear_force_local_indices,
+            len(self.prepared.nonlinear_indices),
+        )
 
     def _residual_jacobian_parameter(
         self,
@@ -298,9 +302,13 @@ class CondensedContinuationSolver:
         parameter: float,
         linear_state: _ContinuationLinearState,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], _ContinuationLinearState]:
-        local_x = _evaluate_local_state(nonlinear_vector, self.prepared)
+        local_x = _evaluate_coordinate_state(nonlinear_vector, self.prepared)
         force, partials = self._local_nonlinear_values(local_x, parameter)
-        nonlinear_force = _stack_local_coefficients(force, self.prepared, self.config.sample_fft)
+        nonlinear_force = _scatter_local_coefficients(
+            _stack_local_coefficients(force, self.prepared, self.config.sample_fft),
+            self.prepared.nonlinear_force_local_indices,
+            nonlinear_vector.size,
+        )
         nonlinear_parameter = self._local_nonlinear_parameter_coefficients(local_x, parameter)
         residual = linear_state.condensed_force - nonlinear_force - linear_state.condensed_linear @ nonlinear_vector
         jacobian = linear_state.condensed_linear + _local_nonlinear_jacobian(partials, self.prepared)
@@ -695,8 +703,7 @@ class CondensedContinuationSolver:
 
 
 def _prepare_condensed_problem(
-    model: SecondOrderTimeModel,
-    nonlinear_dofs: tuple[int, ...],
+    model: CondensedSecondOrderTimeModel,
     *,
     harmonics: tuple[float, ...],
     nonlinear_harmonics: tuple[float, ...] | None,
@@ -707,10 +714,15 @@ def _prepare_condensed_problem(
     s3_quadrature_samples: int | None,
     progress_callback: Callable[[str], None] | None,
 ) -> _PreparedCondensedProblem:
-    if len(set(nonlinear_dofs)) != len(nonlinear_dofs):
-        raise ValueError("nonlinear_dofs must be unique")
-    if any(dof < 0 or dof >= model.n_dof for dof in nonlinear_dofs):
-        raise ValueError("nonlinear_dofs contains an out-of-range DOF")
+    force_dofs = _validate_model_dofs("nonlinear_force_dofs", model.nonlinear_force_dofs, model.n_dof)
+    coordinate_dofs = _validate_model_dofs(
+        "nonlinear_coordinate_dofs",
+        model.nonlinear_coordinate_dofs,
+        model.n_dof,
+    )
+    nonlinear_dofs = _ordered_union(force_dofs, coordinate_dofs)
+    if not nonlinear_dofs:
+        raise ValueError("condensed models must define at least one nonlinear DOF")
     active_nonlinear_harmonics = nonlinear_harmonics or build_full_fft_nonlinear_harmonics(
         sample_fft,
         frequency_resolution,
@@ -730,6 +742,15 @@ def _prepare_condensed_problem(
     nonlinear_set = set(nonlinear_dofs)
     linear_dofs = tuple(dof for dof in range(model.n_dof) if dof not in nonlinear_set)
     nonlinear_indices = _coefficient_indices(nonlinear_dofs, context.order)
+    local_position_by_dof = {dof: position for position, dof in enumerate(nonlinear_dofs)}
+    nonlinear_force_local_indices = _coefficient_indices(
+        tuple(local_position_by_dof[dof] for dof in force_dofs),
+        context.order,
+    )
+    nonlinear_coordinate_local_indices = _coefficient_indices(
+        tuple(local_position_by_dof[dof] for dof in coordinate_dofs),
+        context.order,
+    )
     linear_indices = _coefficient_indices(linear_dofs, context.order)
     (
         operator_ll_blocks,
@@ -753,8 +774,12 @@ def _prepare_condensed_problem(
         hb_item_dt=hb_item_dt,
         hb_item_ddt=hb_item_ddt,
         nonlinear_dofs=nonlinear_dofs,
+        nonlinear_force_dofs=force_dofs,
+        nonlinear_coordinate_dofs=coordinate_dofs,
         linear_dofs=linear_dofs,
         nonlinear_indices=nonlinear_indices,
+        nonlinear_force_local_indices=nonlinear_force_local_indices,
+        nonlinear_coordinate_local_indices=nonlinear_coordinate_local_indices,
         linear_indices=linear_indices,
         operator_ll_blocks=operator_ll_blocks,
         operator_ln_blocks=operator_ln_blocks,
@@ -765,6 +790,25 @@ def _prepare_condensed_problem(
     )
 
 
+def _validate_model_dofs(name: str, dofs: Sequence[int], n_dof: int) -> tuple[int, ...]:
+    normalized = tuple(int(dof) for dof in dofs)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{name} must contain unique DOFs")
+    if any(dof < 0 or dof >= n_dof for dof in normalized):
+        raise ValueError(f"{name} contains an out-of-range DOF")
+    return normalized
+
+
+def _ordered_union(first: Sequence[int], second: Sequence[int]) -> tuple[int, ...]:
+    values: list[int] = []
+    seen: set[int] = set()
+    for dof in tuple(first) + tuple(second):
+        if dof not in seen:
+            values.append(int(dof))
+            seen.add(int(dof))
+    return tuple(values)
+
+
 def _validate_positive_scale(name: str, value: float) -> None:
     scale = float(value)
     if not np.isfinite(scale) or scale <= 0.0:
@@ -772,7 +816,7 @@ def _validate_positive_scale(name: str, value: float) -> None:
 
 
 def _prepare_structured_parameter_blocks(
-    model: SecondOrderTimeModel,
+    model: CondensedSecondOrderTimeModel,
     context: HBContext,
     t: NDArray[np.float64],
     sample_fft: int,
@@ -969,14 +1013,15 @@ def _recover_full_vector(
     return full
 
 
-def _evaluate_local_state(
+def _evaluate_coordinate_state(
     nonlinear_vector: NDArray[np.float64],
     prepared: _PreparedCondensedProblem,
 ) -> NDArray[np.float64]:
+    coordinate_vector = nonlinear_vector[prepared.nonlinear_coordinate_local_indices]
     coefficients = unflatten_coefficients(
-        nonlinear_vector,
+        coordinate_vector,
         prepared.context.order,
-        len(prepared.nonlinear_dofs),
+        len(prepared.nonlinear_coordinate_dofs),
     )
     return prepared.hb_item @ coefficients
 
@@ -985,17 +1030,30 @@ def _validate_local_force_and_partials(
     force: NDArray[np.float64],
     partials: NDArray[np.float64],
     prepared: _PreparedCondensedProblem,
-    local_dof_count: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     force = np.asarray(force, dtype=np.float64)
     partials = np.asarray(partials, dtype=np.float64)
-    expected_force_shape = (prepared.t.size, local_dof_count)
-    expected_partials_shape = (prepared.t.size, local_dof_count, local_dof_count)
+    expected_force_shape = (prepared.t.size, len(prepared.nonlinear_force_dofs))
+    expected_partials_shape = (
+        prepared.t.size,
+        len(prepared.nonlinear_force_dofs),
+        len(prepared.nonlinear_coordinate_dofs),
+    )
     if force.shape != expected_force_shape:
         raise ValueError(f"local nonlinear force must have shape {expected_force_shape}, got {force.shape}")
     if partials.shape != expected_partials_shape:
         raise ValueError(f"local nonlinear partials must have shape {expected_partials_shape}, got {partials.shape}")
     return force, partials
+
+
+def _scatter_local_coefficients(
+    local_coefficients: NDArray[np.float64],
+    local_indices: NDArray[np.int64],
+    size: int,
+) -> NDArray[np.float64]:
+    values = np.zeros(size, dtype=np.float64)
+    values[local_indices] = local_coefficients
+    return values
 
 
 def _stack_local_coefficients(
@@ -1017,9 +1075,10 @@ def _local_nonlinear_jacobian(
 ) -> NDArray[np.float64]:
     context = prepared.context
     order = context.order
-    local_dof_count = partials.shape[1]
-    jacobian = np.zeros((local_dof_count * order, local_dof_count * order), dtype=np.float64)
-    values = partials.reshape(partials.shape[0], local_dof_count * local_dof_count, order="C")
+    force_count = len(prepared.nonlinear_force_dofs)
+    coordinate_count = len(prepared.nonlinear_coordinate_dofs)
+    jacobian = np.zeros((len(prepared.nonlinear_dofs) * order, len(prepared.nonlinear_dofs) * order), dtype=np.float64)
+    values = partials.reshape(partials.shape[0], force_count * coordinate_count, order="C")
     coeffs = coefficient_matrix_from_fft(
         values,
         context.nonlinear_harmonics,
@@ -1028,10 +1087,12 @@ def _local_nonlinear_jacobian(
     )
     blocks = np.einsum("abk,kt->abt", context.s3_tensor_x, coeffs)
     term = 0
-    for force_index in range(local_dof_count):
-        for coordinate_index in range(local_dof_count):
-            row_slice = slice(force_index * order, (force_index + 1) * order)
-            col_slice = slice(coordinate_index * order, (coordinate_index + 1) * order)
+    force_positions = (prepared.nonlinear_force_local_indices[::order] // order).astype(np.int64)
+    coordinate_positions = (prepared.nonlinear_coordinate_local_indices[::order] // order).astype(np.int64)
+    for force_position in force_positions:
+        for coordinate_position in coordinate_positions:
+            row_slice = slice(force_position * order, (force_position + 1) * order)
+            col_slice = slice(coordinate_position * order, (coordinate_position + 1) * order)
             jacobian[row_slice, col_slice] += blocks[:, :, term]
             term += 1
     return jacobian
