@@ -17,27 +17,36 @@ from ega_ihb import (
     ContinuationConfig,
     ContinuationResult,
     ContinuationSolver,
+    ForcingTerm,
+    LinearOperatorTerm,
     NonlinearJacobianTerm,
     SecondOrderTimeModel,
-    build_quadratic_nonlinear_harmonics,
+    build_full_fft_nonlinear_harmonics,
 )
 
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"
 DEFAULT_OUTPUT = Path("results/example_aeroengine_arc.npz")
-DEFAULT_MAX_STEPS = 500
-DEFAULT_SAMPLE_FFT = 2**15
-FREQUENCY_RESOLUTION = 0.2
-DEFAULT_HARMONIC_PRESET = "mixed"
-HARMONICS = (0.2, 1.0, 1.2, 2.0, 2.2, 2.4)
-NONLINEAR_HARMONICS = build_quadratic_nonlinear_harmonics(
-    HARMONICS,
-    FREQUENCY_RESOLUTION,
-    max_harmonic=2.0 * max(HARMONICS),
-)
-INIT_OMEGA = 140.0
-MAX_EPOCH = 10
+DEFAULT_MAX_STEPS = 400
+DEFAULT_SAMPLE_FFT = 2**11
+FREQUENCY_RESOLUTION = 0.1
+DEFAULT_HARMONIC_PRESET = "condensed_aligned"
+INIT_OMEGA = 145.0
+MAX_EPOCH = 25
 INITIAL_SCALE = 1e-5
+RES_TOLERANCE = 1e-9
+DELTA_TOLERANCE = 1e-12
+Q_SCALE = 1e-4
+OMEGA_SCALE = 200
+
+
+def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
+    count = int(round((stop - start) / step)) + 1
+    return tuple(round(start + step * index, 10) for index in range(count))
+
+
+HARMONICS = harmonic_range(0.5, 3.1, 0.1)
+NONLINEAR_HARMONICS = build_full_fft_nonlinear_harmonics(DEFAULT_SAMPLE_FFT, FREQUENCY_RESOLUTION)
 
 
 @dataclass(frozen=True)
@@ -113,22 +122,21 @@ class AeroEngineRotorModel(SecondOrderTimeModel):
     def _node_x_indices(self, node_locations: tuple[int, ...]) -> NDArray[np.int64]:
         return np.asarray([2 * location - 2 for location in node_locations], dtype=np.int64)
 
-    def mass_matrix(self, parameter: float | None = None) -> NDArray[np.float64]:
-        omega = 1.0 if parameter is None else float(parameter)
-        return omega**2 * self.mass
+    def linear_operator_terms(self) -> tuple[LinearOperatorTerm, ...]:
+        return (
+            LinearOperatorTerm(self.mass, "ddx", 2.0),
+            LinearOperatorTerm(self.damping, "dx", 1.0),
+            LinearOperatorTerm(self.gyroscopic, "dx", 2.0),
+            LinearOperatorTerm(self.stiffness, "x", 0.0),
+        )
 
-    def damping_matrix(self, parameter: float) -> NDArray[np.float64]:
-        omega = float(parameter)
-        return omega * self.damping + omega**2 * self.gyroscopic
+    def forcing_terms(self, t: NDArray[np.float64]) -> tuple[ForcingTerm, ...]:
+        return (ForcingTerm(self._base_unbalance_force(t), 2.0),)
 
-    def stiffness_matrix(self, parameter: float) -> NDArray[np.float64]:
-        return self.stiffness
-
-    def forcing(self, t: NDArray[np.float64], parameter: float) -> NDArray[np.float64]:
-        omega = float(parameter)
+    def _base_unbalance_force(self, t: NDArray[np.float64]) -> NDArray[np.float64]:
         force = np.zeros((t.size, self.n_dof), dtype=np.float64)
-        lp_me = self.lp_disk_e * self.lp_disk_m * omega**2
-        hp_me = self.hp_disk_e * self.hp_disk_m * omega**2
+        lp_me = self.lp_disk_e * self.lp_disk_m
+        hp_me = self.hp_disk_e * self.hp_disk_m
 
         force[:, self.lp_disk_x] = np.cos(t)[:, None] * lp_me[None, :]
         force[:, self.lp_disk_y] = np.sin(t)[:, None] * lp_me[None, :]
@@ -201,35 +209,6 @@ class AeroEngineRotorModel(SecondOrderTimeModel):
             NonlinearJacobianTerm(oy, "x", oy, dfy_dy),
         )
 
-    def parameter_derivative(
-        self,
-        t: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        omega = float(parameter)
-        return (
-            self._forcing_derivative(t, omega)
-            - (2.0 * omega * self.mass @ ddx.T).T
-            - ((self.damping + 2.0 * omega * self.gyroscopic) @ dx.T).T
-        )
-
-    def _forcing_derivative(self, t: NDArray[np.float64], omega: float) -> NDArray[np.float64]:
-        derivative = np.zeros((t.size, self.n_dof), dtype=np.float64)
-        lp_me_derivative = 2.0 * self.lp_disk_e * self.lp_disk_m * omega
-        hp_me_derivative = 2.0 * self.hp_disk_e * self.hp_disk_m * omega
-
-        derivative[:, self.lp_disk_x] = np.cos(t)[:, None] * lp_me_derivative[None, :]
-        derivative[:, self.lp_disk_y] = np.sin(t)[:, None] * lp_me_derivative[None, :]
-
-        hp_scale = self.speed_ratio**2
-        hp_angle = self.speed_ratio * t
-        derivative[:, self.hp_disk_x] = hp_scale * np.cos(hp_angle)[:, None] * hp_me_derivative[None, :]
-        derivative[:, self.hp_disk_y] = hp_scale * np.sin(hp_angle)[:, None] * hp_me_derivative[None, :]
-        return derivative
-
     def _bearing_force_and_partials(
         self,
         t: NDArray[np.float64],
@@ -288,17 +267,19 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
     return ContinuationConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
-        nonlinear_harmonics=NONLINEAR_HARMONICS,
+        nonlinear_harmonics=build_full_fft_nonlinear_harmonics(args.sample_fft, FREQUENCY_RESOLUTION),
         frequency_resolution=FREQUENCY_RESOLUTION,
         strict_fft_grid=True,
         seed=args.seed,
         init_omega=INIT_OMEGA,
         max_epoch=MAX_EPOCH,
-        res_tolerance=1e-10,
-        delta_tolerance=1e-10,
+        res_tolerance=RES_TOLERANCE,
+        delta_tolerance=DELTA_TOLERANCE,
         s_initial=0.1,
         s_max=0.1,
         s_min=1e-9,
+        q_scale=Q_SCALE,
+        omega_scale=OMEGA_SCALE,
         max_steps=args.max_steps,
         enable_ode_check=args.ode_check,
         progress_callback=print,

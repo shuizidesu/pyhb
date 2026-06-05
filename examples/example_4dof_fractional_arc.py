@@ -16,6 +16,8 @@ from ega_ihb import (
     ContinuationConfig,
     ContinuationResult,
     ContinuationSolver,
+    ForcingTerm,
+    LinearOperatorTerm,
     NonlinearJacobianTerm,
     SecondOrderTimeModel,
     build_quadratic_nonlinear_harmonics,
@@ -139,23 +141,22 @@ class FourDofFractionalModel(SecondOrderTimeModel):
     def n_dof(self) -> int:
         return self.system.n_dof
 
-    def mass_matrix(self, parameter: float | None = None) -> NDArray[np.float64]:
-        return self.system.mass
+    def linear_operator_terms(self) -> tuple[LinearOperatorTerm, ...]:
+        return (
+            LinearOperatorTerm(self.system.mass, "ddx", 0.0),
+            LinearOperatorTerm(self.system.damping, "dx", 0.0),
+            LinearOperatorTerm(self.system.rotational_damping, "dx", -1.0),
+            LinearOperatorTerm(self.system.stiffness, "x", -2.0),
+        )
 
-    def damping_matrix(self, parameter: float) -> NDArray[np.float64]:
-        return self.system.damping + self.system.rotational_damping / parameter
-
-    def stiffness_matrix(self, parameter: float) -> NDArray[np.float64]:
-        return self.system.stiffness / parameter**2
-
-    def forcing(self, t: NDArray[np.float64], parameter: float) -> NDArray[np.float64]:
+    def forcing_terms(self, t: NDArray[np.float64]) -> tuple[ForcingTerm, ...]:
         force = np.zeros((t.size, self.n_dof), dtype=np.float64)
         force[:, 0] = self.system.excitation * np.cos(t)
         force[:, 1] = self.system.excitation * np.sin(t)
         fractional_force = self.system.excitation * np.cos(self.fractional_frequency * t)
         force[:, 0] += fractional_force
         force[:, 1] += fractional_force
-        return force
+        return (ForcingTerm(force, 0.0),)
 
     def nonlinear_force(
         self,
@@ -184,7 +185,7 @@ class FourDofFractionalModel(SecondOrderTimeModel):
             NonlinearJacobianTerm(1, "x", 1, factor * x[:, 1] ** 2),
         )
 
-    def parameter_derivative(
+    def nonlinear_parameter_derivative(
         self,
         t: NDArray[np.float64],
         x: NDArray[np.float64],
@@ -192,16 +193,10 @@ class FourDofFractionalModel(SecondOrderTimeModel):
         ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
-        x_t = np.asarray(x, dtype=np.float64).T
-        dx_t = np.asarray(dx, dtype=np.float64).T
-        nonlinear = np.zeros_like(x_t)
-        nonlinear[0, :] = (2.0 * self.system.nonlinear_scale / parameter**3) * x[:, 0] ** 3
-        nonlinear[1, :] = (2.0 * self.system.nonlinear_scale / parameter**3) * x[:, 1] ** 3
-        return (
-            2.0 * self.system.stiffness / parameter**3 @ x_t
-            + self.system.rotational_damping / parameter**2 @ dx_t
-            + nonlinear
-        ).T
+        derivative = np.zeros_like(x)
+        derivative[:, 0] = (-2.0 * self.system.nonlinear_scale / parameter**3) * x[:, 0] ** 3
+        derivative[:, 1] = (-2.0 * self.system.nonlinear_scale / parameter**3) * x[:, 1] ** 3
+        return derivative
 
 
 def parse_args() -> argparse.Namespace:

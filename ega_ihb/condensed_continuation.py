@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -20,26 +19,12 @@ from .harmonics import (
     unflatten_coefficients,
 )
 from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics, harmonic_integral_matrices
-from .models import CondensedSecondOrderTimeModel
+from .models import CondensedSecondOrderTimeModel, ForcingTerm, LinearOperatorTerm
 
 
-LinearBasisType = Literal["ddx", "dx", "x"]
 _LOOP_REVISIT_EXCLUSION_STEPS = 20
 _LOOP_MIN_HISTORY_STEPS = 50
 _LOOP_RESTART_RECENT_CANDIDATES = 3
-
-
-@dataclass(frozen=True)
-class LinearOperatorTerm:
-    matrix: NDArray[np.float64] | sparse.spmatrix
-    basis_type: LinearBasisType
-    parameter_power: float
-
-
-@dataclass(frozen=True)
-class ForcingTerm:
-    samples: NDArray[np.float64]
-    parameter_power: float
 
 
 @dataclass(frozen=True)

@@ -5,16 +5,36 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy import sparse
 
 
 JacobianVariable = Literal["x", "dx", "ddx"]
+LinearBasisType = Literal["ddx", "dx", "x"]
 
-if TYPE_CHECKING:
-    from .condensed_continuation import ForcingTerm, LinearOperatorTerm
+
+@dataclass(frozen=True)
+class LinearOperatorTerm:
+    """One structured linear operator contribution.
+
+    ``basis_type`` chooses the HB derivative basis and ``parameter_power``
+    specifies the continuation-parameter multiplier.
+    """
+
+    matrix: NDArray[np.float64] | sparse.spmatrix
+    basis_type: LinearBasisType
+    parameter_power: float
+
+
+@dataclass(frozen=True)
+class ForcingTerm:
+    """External force samples multiplied by a continuation-parameter power."""
+
+    samples: NDArray[np.float64]
+    parameter_power: float
 
 
 @dataclass(frozen=True)
@@ -48,20 +68,12 @@ class SecondOrderTimeModel(ABC):
         """Number of physical degrees of freedom."""
 
     @abstractmethod
-    def mass_matrix(self, parameter: float | None = None) -> NDArray[np.float64]:
-        """Mass matrix ``M`` or effective mass matrix for the active parameter."""
+    def linear_operator_terms(self) -> Sequence[LinearOperatorTerm]:
+        """Structured linear operator terms for HB assembly."""
 
     @abstractmethod
-    def damping_matrix(self, parameter: float) -> NDArray[np.float64]:
-        """Effective damping matrix for the active continuation parameter."""
-
-    @abstractmethod
-    def stiffness_matrix(self, parameter: float) -> NDArray[np.float64]:
-        """Effective stiffness matrix for the active continuation parameter."""
-
-    @abstractmethod
-    def forcing(self, t: NDArray[np.float64], parameter: float) -> NDArray[np.float64]:
-        """External force samples shaped ``(samples, n_dof)``."""
+    def forcing_terms(self, t: NDArray[np.float64]) -> Sequence[ForcingTerm]:
+        """External force samples represented as powered forcing terms."""
 
     @abstractmethod
     def nonlinear_force(
@@ -85,8 +97,7 @@ class SecondOrderTimeModel(ABC):
     ) -> tuple[NonlinearJacobianTerm, ...]:
         """Nonzero time-domain nonlinear Jacobian entries."""
 
-    @abstractmethod
-    def parameter_derivative(
+    def nonlinear_parameter_derivative(
         self,
         t: NDArray[np.float64],
         x: NDArray[np.float64],
@@ -94,7 +105,9 @@ class SecondOrderTimeModel(ABC):
         ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
-        """Time-domain samples of ``dR/dparameter`` shaped ``(samples, n_dof)``."""
+        """Return ``dN/dparameter`` samples; defaults to zero."""
+
+        return np.zeros((t.size, self.n_dof), dtype=np.float64)
 
     def rhs(self, t: float, y: NDArray[np.float64], parameter: float) -> NDArray[np.float64]:
         """Default first-order RHS for optional ODE verification."""
@@ -105,7 +118,7 @@ class SecondOrderTimeModel(ABC):
         x_sample = x.reshape(1, n)
         v_sample = v.reshape(1, n)
         ddx_sample = np.zeros((1, n), dtype=np.float64)
-        force = self.forcing(np.array([t], dtype=np.float64), parameter)[0]
+        force = _combine_forcing_terms(self.forcing_terms(np.array([t], dtype=np.float64)), parameter, n)[0]
         nonlinear = self.nonlinear_force(
             np.array([t], dtype=np.float64),
             x_sample,
@@ -113,9 +126,10 @@ class SecondOrderTimeModel(ABC):
             ddx_sample,
             parameter,
         )[0]
+        mass, damping, stiffness = _combine_time_operator_matrices(self.linear_operator_terms(), parameter, n)
         acceleration = np.linalg.solve(
-            self.mass_matrix(parameter),
-            force - nonlinear - self.damping_matrix(parameter) @ v - self.stiffness_matrix(parameter) @ x,
+            mass,
+            force - nonlinear - damping @ v - stiffness @ x,
         )
         return np.concatenate((v, acceleration))
 
@@ -150,11 +164,11 @@ class CondensedSecondOrderTimeModel(ABC):
         """Global DOFs whose coordinates enter the local nonlinear law."""
 
     @abstractmethod
-    def linear_operator_terms(self) -> Sequence["LinearOperatorTerm"]:
+    def linear_operator_terms(self) -> Sequence[LinearOperatorTerm]:
         """Structured linear operator terms for the condensed solver."""
 
     @abstractmethod
-    def forcing_terms(self, t: NDArray[np.float64]) -> Sequence["ForcingTerm"]:
+    def forcing_terms(self, t: NDArray[np.float64]) -> Sequence[ForcingTerm]:
         """External force samples represented as powered forcing terms."""
 
     @abstractmethod
@@ -175,3 +189,43 @@ class CondensedSecondOrderTimeModel(ABC):
         """Return local ``dN/dparameter`` samples; defaults to zero."""
 
         return np.zeros((t.size, len(self.nonlinear_force_dofs)), dtype=np.float64)
+
+
+def _as_dense_matrix(matrix: NDArray[np.float64] | sparse.spmatrix) -> NDArray[np.float64]:
+    if sparse.issparse(matrix):
+        return np.asarray(matrix.toarray(), dtype=np.float64)
+    return np.asarray(matrix, dtype=np.float64)
+
+
+def _combine_time_operator_matrices(
+    terms: Sequence[LinearOperatorTerm],
+    parameter: float,
+    n_dof: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    matrices = {
+        "ddx": np.zeros((n_dof, n_dof), dtype=np.float64),
+        "dx": np.zeros((n_dof, n_dof), dtype=np.float64),
+        "x": np.zeros((n_dof, n_dof), dtype=np.float64),
+    }
+    for term in terms:
+        if term.basis_type not in matrices:
+            raise ValueError(f"unsupported linear operator basis_type: {term.basis_type!r}")
+        matrices[term.basis_type] += float(parameter) ** float(term.parameter_power) * _as_dense_matrix(term.matrix)
+    return matrices["ddx"], matrices["dx"], matrices["x"]
+
+
+def _combine_forcing_terms(
+    terms: Sequence[ForcingTerm],
+    parameter: float,
+    n_dof: int,
+) -> NDArray[np.float64]:
+    result: NDArray[np.float64] | None = None
+    for term in terms:
+        samples = np.asarray(term.samples, dtype=np.float64)
+        if samples.ndim != 2 or samples.shape[1] != n_dof:
+            raise ValueError(f"forcing term samples must have shape (samples, {n_dof}), got {samples.shape}")
+        contribution = float(parameter) ** float(term.parameter_power) * samples
+        result = contribution if result is None else result + contribution
+    if result is None:
+        return np.zeros((0, n_dof), dtype=np.float64)
+    return result

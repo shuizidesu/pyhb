@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy import sparse
 from scipy.integrate import solve_ivp
 from scipy.linalg import null_space
 
 from .harmonics import coefficient_matrix_from_fft, flatten_coefficients, generate_hb_items, stack_fft_coefficients, unflatten_coefficients
-from .hb_operators import HBContext, linear_jacobian
+from .hb_operators import HBContext, harmonic_integral_matrices
 from .models import SecondOrderTimeModel
 
 
@@ -33,6 +34,8 @@ class ContinuationConfig:
     s_initial: float = 0.05
     s_max: float = 0.1
     s_min: float = 1e-6
+    q_scale: float = 1.0
+    omega_scale: float = 1.0
     max_steps: int = 500
     shrink_limit: int = 20
     plot_dt: float = 0.01
@@ -87,6 +90,8 @@ class _PreparedProblem:
     hb_item_dt: NDArray[np.float64]
     hb_item_ddt: NDArray[np.float64]
     hb_item_plot: NDArray[np.float64]
+    operator_blocks: dict[float, NDArray[np.float64]]
+    forcing_blocks: dict[float, NDArray[np.float64]]
 
 
 class ContinuationSolver:
@@ -95,6 +100,8 @@ class ContinuationSolver:
     def __init__(self, model: SecondOrderTimeModel, config: ContinuationConfig | None = None) -> None:
         self.model = model
         self.config = config or ContinuationConfig()
+        _validate_positive_scale("q_scale", self.config.q_scale)
+        _validate_positive_scale("omega_scale", self.config.omega_scale)
         self.prepared = self._prepare()
 
     def _prepare(self) -> _PreparedProblem:
@@ -122,6 +129,12 @@ class ContinuationSolver:
             t_plot = np.arange(0.0, context.period + 0.5 * config.plot_dt, config.plot_dt)
         hb_item, hb_item_dt, hb_item_ddt = generate_hb_items(t, context.harmonics)
         hb_item_plot, _, _ = generate_hb_items(t_plot, context.harmonics)
+        operator_blocks, forcing_blocks = _prepare_structured_parameter_blocks(
+            self.model,
+            context,
+            t,
+            config.sample_fft,
+        )
         return _PreparedProblem(
             self.model,
             context,
@@ -130,6 +143,8 @@ class ContinuationSolver:
             hb_item_dt,
             hb_item_ddt,
             hb_item_plot,
+            operator_blocks,
+            forcing_blocks,
         )
 
     def _emit_progress(self, message: str) -> None:
@@ -153,35 +168,33 @@ class ContinuationSolver:
         return coeff, x, dx, ddx
 
     def _linear_jacobian(self, parameter: float) -> NDArray[np.float64]:
-        return linear_jacobian(
-            self.model.mass_matrix(parameter),
-            self.model.damping_matrix(parameter),
-            self.model.stiffness_matrix(parameter),
-            self.prepared.context.harmonics,
-        )
+        return _combine_powered_dense_blocks(self.prepared.operator_blocks, parameter)
+
+    def _linear_jacobian_derivative(self, parameter: float) -> NDArray[np.float64]:
+        return _combine_powered_dense_blocks(self.prepared.operator_blocks, parameter, derivative=True)
+
+    def _forcing_coefficients(self, parameter: float) -> NDArray[np.float64]:
+        return _combine_powered_dense_blocks(self.prepared.forcing_blocks, parameter)
+
+    def _forcing_derivative_coefficients(self, parameter: float) -> NDArray[np.float64]:
+        return _combine_powered_dense_blocks(self.prepared.forcing_blocks, parameter, derivative=True)
 
     def _residual(
         self,
+        coeff_line: NDArray[np.float64],
         x: NDArray[np.float64],
         dx: NDArray[np.float64],
         ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
         model = self.model
-        t = self.prepared.t
-        samples = (
-            model.forcing(t, parameter)
-            - model.nonlinear_force(t, x, dx, ddx, parameter)
-            - (model.mass_matrix(parameter) @ ddx.T).T
-            - (model.damping_matrix(parameter) @ dx.T).T
-            - (model.stiffness_matrix(parameter) @ x.T).T
-        )
-        return stack_fft_coefficients(
-            samples,
+        nonlinear_coefficients = stack_fft_coefficients(
+            model.nonlinear_force(self.prepared.t, x, dx, ddx, parameter),
             self.prepared.context.harmonics,
             self.config.sample_fft,
             self.prepared.context.harmonic_indices,
         )
+        return self._forcing_coefficients(parameter) - nonlinear_coefficients - self._linear_jacobian(parameter) @ coeff_line
 
     def _jacobian(
         self,
@@ -258,18 +271,24 @@ class ContinuationSolver:
 
     def _parameter_jacobian(
         self,
+        coeff_line: NDArray[np.float64],
         x: NDArray[np.float64],
         dx: NDArray[np.float64],
         ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
-        samples = self.model.parameter_derivative(self.prepared.t, x, dx, ddx, parameter)
-        return stack_fft_coefficients(
-            samples,
+        nonlinear_parameter = stack_fft_coefficients(
+            self.model.nonlinear_parameter_derivative(self.prepared.t, x, dx, ddx, parameter),
             self.prepared.context.harmonics,
             self.config.sample_fft,
             self.prepared.context.harmonic_indices,
-        ).reshape(-1, 1)
+        )
+        parameter_column = (
+            self._forcing_derivative_coefficients(parameter)
+            - nonlinear_parameter
+            - self._linear_jacobian_derivative(parameter) @ coeff_line
+        )
+        return parameter_column.reshape(-1, 1)
 
     def _solve_initial(
         self,
@@ -290,7 +309,7 @@ class ContinuationSolver:
         ):
             coeff, x, dx, ddx = self._evaluate_state(coeff_line)
             jacobian = self._jacobian(x, dx, ddx, parameter)
-            residual_vector = self._residual(x, dx, ddx, parameter)
+            residual_vector = self._residual(coeff_line, x, dx, ddx, parameter)
             delta = np.linalg.solve(jacobian, residual_vector)
             coeff_line = coeff_line + delta
             epoch += 1
@@ -311,15 +330,38 @@ class ContinuationSolver:
         )
         return coeff_line, coeff, x, dx, jacobian, log
 
-    def _initial_tangent(self, j: NDArray[np.float64], j_parameter: NDArray[np.float64]) -> NDArray[np.float64]:
-        j_arc = np.hstack((-j, j_parameter))
+    def _orient_initial_tangent(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
+        oriented = np.asarray(tangent, dtype=np.float64)
+        if oriented[-1] < 0.0:
+            oriented = -oriented
+        return self._weighted_normalize(oriented)
+
+    def _initial_tangent(self, jacobian: NDArray[np.float64], parameter_column: NDArray[np.float64]) -> NDArray[np.float64]:
+        j_arc = np.hstack((-jacobian, parameter_column))
         basis = null_space(j_arc)
         if basis.shape[1] == 0:
             raise np.linalg.LinAlgError("arc Jacobian has no numerical null-space")
-        tangent = basis[:, 0]
-        if tangent[-1] < 0.0:
-            tangent = -tangent
-        return tangent / np.linalg.norm(tangent)
+        return self._orient_initial_tangent(basis[:, 0])
+
+    def _arc_weights(self, size: int) -> NDArray[np.float64]:
+        return np.concatenate(
+            (
+                np.full(size - 1, 1.0 / float(self.config.q_scale) ** 2, dtype=np.float64),
+                np.array([1.0 / float(self.config.omega_scale) ** 2], dtype=np.float64),
+            )
+        )
+
+    def _weighted_constraint_row(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
+        return self._arc_weights(tangent.size) * tangent
+
+    def _weighted_inner(self, left: NDArray[np.float64], right: NDArray[np.float64]) -> float:
+        return float(left @ (self._arc_weights(left.size) * right))
+
+    def _weighted_normalize(self, vector: NDArray[np.float64]) -> NDArray[np.float64]:
+        norm = np.sqrt(self._weighted_inner(vector, vector))
+        if norm == 0.0:
+            raise np.linalg.LinAlgError("arc tangent has zero weighted norm")
+        return vector / norm
 
     def _run_ode_check(self, coeff: NDArray[np.float64], parameter: float) -> OdeCheckResult:
         config = self.config
@@ -364,7 +406,7 @@ class ContinuationSolver:
             f"Delta = {initial_log.max_delta:.6e}, Omega = {initial_log.omega:.10g}"
         )
         _, _, _, ddx = self._evaluate_state(coeff_line)
-        j_parameter = self._parameter_jacobian(x, dx, ddx, parameter)
+        j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
         tangent = self._initial_tangent(jacobian, j_parameter)
         y0 = np.concatenate((coeff_line, np.array([parameter], dtype=np.float64)))
 
@@ -391,13 +433,19 @@ class ContinuationSolver:
             ):
                 coeff, x, dx, ddx = self._evaluate_state(coeff_line)
                 jacobian = self._jacobian(x, dx, ddx, parameter)
-                residual_vector = self._residual(x, dx, ddx, parameter)
-                j_parameter = self._parameter_jacobian(x, dx, ddx, parameter)
+                residual_vector = self._residual(coeff_line, x, dx, ddx, parameter)
+                j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
                 j_arc = np.hstack((-jacobian, j_parameter))
                 r_arc = np.concatenate(
-                    (residual_vector, np.array([(y - y0) @ tangent - arc_length_step], dtype=np.float64))
+                    (
+                        residual_vector,
+                        np.array(
+                            [self._weighted_inner(y - y0, tangent) - arc_length_step],
+                            dtype=np.float64,
+                        ),
+                    )
                 )
-                j_arc_v = np.vstack((j_arc, tangent[None, :]))
+                j_arc_v = np.vstack((j_arc, self._weighted_constraint_row(tangent)[None, :]))
                 delta = np.linalg.solve(j_arc_v, r_arc)
                 y = y - delta
                 coeff_line = y[:-1].copy()
@@ -424,7 +472,7 @@ class ContinuationSolver:
                     j_arc_v,
                     np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0]))),
                 )
-                tangent = tangent_candidate / np.linalg.norm(tangent_candidate)
+                tangent = self._weighted_normalize(tangent_candidate)
                 coeff, _, _, _ = self._evaluate_state(coeff_line)
                 y_plot = self.prepared.hb_item_plot @ coeff
                 amplitudes.append(rms_amplitude(y_plot))
@@ -485,3 +533,108 @@ class ContinuationSolver:
 def rms_amplitude(samples: NDArray[np.float64]) -> NDArray[np.float64]:
     centered = samples - np.mean(samples, axis=0, keepdims=True)
     return np.sqrt(np.mean(centered**2, axis=0))
+
+
+def _validate_positive_scale(name: str, value: float) -> None:
+    scale = float(value)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"{name} must be a positive finite value, got {value!r}")
+
+
+def _prepare_structured_parameter_blocks(
+    model: SecondOrderTimeModel,
+    context: HBContext,
+    t: NDArray[np.float64],
+    sample_fft: int,
+) -> tuple[dict[float, NDArray[np.float64]], dict[float, NDArray[np.float64]]]:
+    mass_basis, damping_basis, stiffness_basis = harmonic_integral_matrices(context.harmonics)
+    basis_by_type = {
+        "ddx": mass_basis,
+        "dx": damping_basis,
+        "x": stiffness_basis,
+    }
+
+    operator_blocks: dict[float, NDArray[np.float64]] = {}
+    linear_terms = tuple(model.linear_operator_terms())
+    if not linear_terms:
+        raise ValueError("model.linear_operator_terms() must return at least one term")
+    for term in linear_terms:
+        if term.basis_type not in basis_by_type:
+            raise ValueError(f"unsupported linear operator basis_type: {term.basis_type!r}")
+        matrix = _as_dense_matrix(term.matrix)
+        expected_matrix_shape = (model.n_dof, model.n_dof)
+        if matrix.shape != expected_matrix_shape:
+            raise ValueError(f"linear operator matrix must have shape {expected_matrix_shape}, got {matrix.shape}")
+        power = _validated_parameter_power(term.parameter_power)
+        _add_powered_dense_block(operator_blocks, power, np.kron(matrix, basis_by_type[term.basis_type]))
+
+    forcing_blocks: dict[float, NDArray[np.float64]] = {}
+    forcing_terms = tuple(model.forcing_terms(t))
+    if not forcing_terms:
+        raise ValueError("model.forcing_terms(t) must return at least one term")
+    for term in forcing_terms:
+        samples = np.asarray(term.samples, dtype=np.float64)
+        expected_samples_shape = (t.size, model.n_dof)
+        if samples.shape != expected_samples_shape:
+            raise ValueError(f"forcing term samples must have shape {expected_samples_shape}, got {samples.shape}")
+        power = _validated_parameter_power(term.parameter_power)
+        coefficients = stack_fft_coefficients(
+            samples,
+            context.harmonics,
+            sample_fft,
+            context.harmonic_indices,
+        )
+        _add_powered_dense_block(forcing_blocks, power, coefficients)
+
+    return operator_blocks, forcing_blocks
+
+
+def _as_dense_matrix(matrix: NDArray[np.float64] | sparse.spmatrix) -> NDArray[np.float64]:
+    if sparse.issparse(matrix):
+        return np.asarray(matrix.toarray(), dtype=np.float64)
+    return np.asarray(matrix, dtype=np.float64)
+
+
+def _validated_parameter_power(power: float) -> float:
+    value = float(power)
+    if not np.isfinite(value):
+        raise ValueError(f"parameter_power must be finite, got {power!r}")
+    return value
+
+
+def _add_powered_dense_block(
+    blocks: dict[float, NDArray[np.float64]],
+    power: float,
+    block: NDArray[np.float64],
+) -> None:
+    if power in blocks:
+        blocks[power] = blocks[power] + block
+    else:
+        blocks[power] = block
+
+
+def _combine_powered_dense_blocks(
+    blocks: dict[float, NDArray[np.float64]],
+    parameter: float,
+    *,
+    derivative: bool = False,
+) -> NDArray[np.float64]:
+    if not blocks:
+        raise ValueError("at least one parameter block is required")
+    active_parameter = float(parameter)
+    result: NDArray[np.float64] | None = None
+    for power, block in blocks.items():
+        scale = _parameter_derivative_scale(active_parameter, power) if derivative else active_parameter**power
+        if scale == 0.0:
+            continue
+        contribution = scale * block
+        result = contribution if result is None else result + contribution
+    if result is None:
+        return np.zeros_like(next(iter(blocks.values())))
+    return result
+
+
+def _parameter_derivative_scale(parameter: float, power: float) -> float:
+    if power == 0.0:
+        return 0.0
+    return power * parameter ** (power - 1.0)
