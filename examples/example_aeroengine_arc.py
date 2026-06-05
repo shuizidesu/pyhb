@@ -20,7 +20,7 @@ from examples.aeroengine_model import AeroEngineRotorModel
 
 
 DEFAULT_OUTPUT = Path("results/example_aeroengine_arc.npz")
-DEFAULT_MAX_STEPS = 600
+DEFAULT_MAX_STEPS = 800
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 0.1
 INIT_OMEGA = 145.0
@@ -44,7 +44,6 @@ HARMONICS = harmonic_range(0.5, 3.1, 0.1)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the aero-engine rotor EGA-IHB arc-length example.")
-    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--sample-fft", type=int, default=DEFAULT_SAMPLE_FFT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -57,7 +56,6 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
         strict_fft_grid=True,
-        seed=args.seed,
         init_omega=INIT_OMEGA,
         max_epoch=MAX_EPOCH,
         res_tolerance=RES_TOLERANCE,
@@ -72,8 +70,8 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
     )
 
 
-def build_initial_coefficients(model: AeroEngineRotorModel, order: int, seed: int) -> NDArray[np.float64]:
-    rng = np.random.default_rng(seed)
+def build_initial_coefficients(model: AeroEngineRotorModel, order: int) -> NDArray[np.float64]:
+    rng = np.random.default_rng(0)
     return rng.random((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
 
 
@@ -91,7 +89,7 @@ def run_from_args(args: argparse.Namespace) -> None:
     model = AeroEngineRotorModel()
     config = build_config(args)
     order = 2 * len(HARMONICS) + 1
-    initial_coefficients = build_initial_coefficients(model, order, args.seed)
+    initial_coefficients = build_initial_coefficients(model, order)
     result = ContinuationSolver(model, config).run(initial_coefficients=initial_coefficients)
     save_result(result, args.output)
 

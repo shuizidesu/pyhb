@@ -26,7 +26,6 @@ class ContinuationConfig:
     strict_fft_grid: bool | None = None
     s3_method: str = "fast"
     s3_quadrature_samples: int | None = None
-    seed: int = 0
     init_omega: float = 300.0
     max_epoch: int = 10
     res_tolerance: float = 1e-10
@@ -401,11 +400,9 @@ class ContinuationSolver:
         config = self.config
         order = self.prepared.context.order
         if initial_coefficients is None:
-            rng = np.random.default_rng(config.seed)
-            coeff_line = rng.random(self.model.n_dof * order, dtype=np.float64) / 100.0
-        else:
-            initial = np.asarray(initial_coefficients, dtype=np.float64)
-            coeff_line = flatten_coefficients(initial) if initial.ndim == 2 else initial.reshape(-1)
+            raise ValueError("initial_coefficients must be provided")
+        initial = np.asarray(initial_coefficients, dtype=np.float64)
+        coeff_line = flatten_coefficients(initial) if initial.ndim == 2 else initial.reshape(-1)
 
         parameter = float(config.init_omega if initial_parameter is None else initial_parameter)
         coeff_line, coeff, x, dx, jacobian, initial_log = self._solve_initial(coeff_line, parameter)
