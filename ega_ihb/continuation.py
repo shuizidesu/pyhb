@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
 from scipy.integrate import solve_ivp
-from scipy.linalg import null_space
+from scipy.sparse.linalg import splu
 
 from .harmonics import coefficient_matrix_from_fft, flatten_coefficients, generate_hb_items, stack_fft_coefficients, unflatten_coefficients
 from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics, harmonic_integral_matrices
@@ -90,7 +90,7 @@ class _PreparedProblem:
     hb_item_dt: NDArray[np.float64]
     hb_item_ddt: NDArray[np.float64]
     hb_item_plot: NDArray[np.float64]
-    operator_blocks: dict[float, NDArray[np.float64]]
+    operator_blocks: dict[float, sparse.csc_matrix]
     forcing_blocks: dict[float, NDArray[np.float64]]
 
 
@@ -171,11 +171,11 @@ class ContinuationSolver:
         ddx = self.prepared.hb_item_ddt @ coeff
         return coeff, x, dx, ddx
 
-    def _linear_jacobian(self, parameter: float) -> NDArray[np.float64]:
-        return _combine_powered_dense_blocks(self.prepared.operator_blocks, parameter)
+    def _linear_jacobian(self, parameter: float) -> sparse.csc_matrix:
+        return _combine_powered_sparse_blocks(self.prepared.operator_blocks, parameter)
 
-    def _linear_jacobian_derivative(self, parameter: float) -> NDArray[np.float64]:
-        return _combine_powered_dense_blocks(self.prepared.operator_blocks, parameter, derivative=True)
+    def _linear_jacobian_derivative(self, parameter: float) -> sparse.csc_matrix:
+        return _combine_powered_sparse_blocks(self.prepared.operator_blocks, parameter, derivative=True)
 
     def _forcing_coefficients(self, parameter: float) -> NDArray[np.float64]:
         return _combine_powered_dense_blocks(self.prepared.forcing_blocks, parameter)
@@ -206,7 +206,7 @@ class ContinuationSolver:
         dx: NDArray[np.float64],
         ddx: NDArray[np.float64],
         parameter: float,
-    ) -> NDArray[np.float64]:
+    ) -> sparse.csc_matrix:
         return self._linear_jacobian(parameter) + self._nonlinear_jacobian(x, dx, ddx, parameter)
 
     def _nonlinear_jacobian(
@@ -215,14 +215,13 @@ class ContinuationSolver:
         dx: NDArray[np.float64],
         ddx: NDArray[np.float64],
         parameter: float,
-    ) -> NDArray[np.float64]:
+    ) -> sparse.csc_matrix:
         context = self.prepared.context
         order = context.order
         size = self.model.n_dof * order
-        nl_j = np.zeros((size, size), dtype=np.float64)
         terms = tuple(self.model.nonlinear_jacobian_terms(self.prepared.t, x, dx, ddx, parameter))
         if not terms:
-            return nl_j
+            return sparse.csc_matrix((size, size), dtype=np.float64)
 
         tensor_by_variable = {
             "x": context.s3_tensor_x,
@@ -261,17 +260,26 @@ class ContinuationSolver:
         )
         row_offsets = np.arange(order, dtype=np.int64)
         col_offsets = np.arange(order, dtype=np.int64)
+        row_chunks: list[NDArray[np.int64]] = []
+        col_chunks: list[NDArray[np.int64]] = []
+        data_chunks: list[NDArray[np.float64]] = []
 
         for variable, s_tensor in tensor_by_variable.items():
             term_indices = np.asarray([index for index, term_variable in enumerate(variables) if term_variable == variable], dtype=np.int64)
             if term_indices.size == 0:
                 continue
             blocks = np.einsum("abk,kt->abt", s_tensor, coeffs[:, term_indices])
+            term_blocks = np.moveaxis(blocks, 2, 0)
             row_indices = force_dofs[term_indices, None, None] * order + row_offsets[None, :, None]
             col_indices = coordinate_dofs[term_indices, None, None] * order + col_offsets[None, None, :]
-            np.add.at(nl_j, (row_indices, col_indices), np.moveaxis(blocks, 2, 0))
+            row_chunks.append(np.broadcast_to(row_indices, term_blocks.shape).reshape(-1))
+            col_chunks.append(np.broadcast_to(col_indices, term_blocks.shape).reshape(-1))
+            data_chunks.append(term_blocks.reshape(-1))
 
-        return nl_j
+        rows = np.concatenate(row_chunks)
+        cols = np.concatenate(col_chunks)
+        data = np.concatenate(data_chunks)
+        return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
 
     def _parameter_jacobian(
         self,
@@ -314,7 +322,7 @@ class ContinuationSolver:
             coeff, x, dx, ddx = self._evaluate_state(coeff_line)
             jacobian = self._jacobian(x, dx, ddx, parameter)
             residual_vector = self._residual(coeff_line, x, dx, ddx, parameter)
-            delta = np.linalg.solve(jacobian, residual_vector)
+            delta = _solve_sparse(jacobian, residual_vector)
             coeff_line = coeff_line + delta
             epoch += 1
 
@@ -340,12 +348,9 @@ class ContinuationSolver:
             oriented = -oriented
         return self._weighted_normalize(oriented)
 
-    def _initial_tangent(self, jacobian: NDArray[np.float64], parameter_column: NDArray[np.float64]) -> NDArray[np.float64]:
-        j_arc = np.hstack((-jacobian, parameter_column))
-        basis = null_space(j_arc)
-        if basis.shape[1] == 0:
-            raise np.linalg.LinAlgError("arc Jacobian has no numerical null-space")
-        return self._orient_initial_tangent(basis[:, 0])
+    def _initial_tangent(self, jacobian: sparse.csc_matrix, parameter_column: NDArray[np.float64]) -> NDArray[np.float64]:
+        tangent_q = _solve_sparse(jacobian, parameter_column.reshape(-1))
+        return self._orient_initial_tangent(np.concatenate((tangent_q, np.array([1.0], dtype=np.float64))))
 
     def _arc_weights(self, size: int) -> NDArray[np.float64]:
         return np.concatenate(
@@ -428,7 +433,7 @@ class ContinuationSolver:
             parameter = float(y[-1])
             residual_vector = np.full(self.model.n_dof * order, np.inf, dtype=np.float64)
             delta = np.full(self.model.n_dof * order + 1, np.inf, dtype=np.float64)
-            j_arc_v = None
+            j_arc_lu = None
 
             while (
                 epoch < config.max_epoch
@@ -439,7 +444,6 @@ class ContinuationSolver:
                 jacobian = self._jacobian(x, dx, ddx, parameter)
                 residual_vector = self._residual(coeff_line, x, dx, ddx, parameter)
                 j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
-                j_arc = np.hstack((-jacobian, j_parameter))
                 r_arc = np.concatenate(
                     (
                         residual_vector,
@@ -449,8 +453,9 @@ class ContinuationSolver:
                         ),
                     )
                 )
-                j_arc_v = np.vstack((j_arc, self._weighted_constraint_row(tangent)[None, :]))
-                delta = np.linalg.solve(j_arc_v, r_arc)
+                j_arc_v = _augmented_arc_matrix(jacobian, j_parameter, self._weighted_constraint_row(tangent))
+                j_arc_lu = splu(j_arc_v)
+                delta = j_arc_lu.solve(r_arc)
                 y = y - delta
                 coeff_line = y[:-1].copy()
                 parameter = float(y[-1])
@@ -470,12 +475,9 @@ class ContinuationSolver:
 
             if converged:
                 y0 = y.copy()
-                if j_arc_v is None:
+                if j_arc_lu is None:
                     raise RuntimeError("converged before assembling arc Jacobian")
-                tangent_candidate = np.linalg.solve(
-                    j_arc_v,
-                    np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0]))),
-                )
+                tangent_candidate = j_arc_lu.solve(np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0]))))
                 tangent = self._weighted_normalize(tangent_candidate)
                 coeff, _, _, _ = self._evaluate_state(coeff_line)
                 y_plot = self.prepared.hb_item_plot @ coeff
@@ -550,27 +552,31 @@ def _prepare_structured_parameter_blocks(
     context: HBContext,
     t: NDArray[np.float64],
     sample_fft: int,
-) -> tuple[dict[float, NDArray[np.float64]], dict[float, NDArray[np.float64]]]:
+) -> tuple[dict[float, sparse.csc_matrix], dict[float, NDArray[np.float64]]]:
     mass_basis, damping_basis, stiffness_basis = harmonic_integral_matrices(context.harmonics)
     basis_by_type = {
-        "ddx": mass_basis,
-        "dx": damping_basis,
-        "x": stiffness_basis,
+        "ddx": sparse.csc_matrix(mass_basis),
+        "dx": sparse.csc_matrix(damping_basis),
+        "x": sparse.csc_matrix(stiffness_basis),
     }
 
-    operator_blocks: dict[float, NDArray[np.float64]] = {}
+    operator_blocks: dict[float, sparse.csc_matrix] = {}
     linear_terms = tuple(model.linear_operator_terms())
     if not linear_terms:
         raise ValueError("model.linear_operator_terms() must return at least one term")
     for term in linear_terms:
         if term.basis_type not in basis_by_type:
             raise ValueError(f"unsupported linear operator basis_type: {term.basis_type!r}")
-        matrix = _as_dense_matrix(term.matrix)
+        matrix = sparse.csc_matrix(term.matrix, dtype=np.float64)
         expected_matrix_shape = (model.n_dof, model.n_dof)
         if matrix.shape != expected_matrix_shape:
             raise ValueError(f"linear operator matrix must have shape {expected_matrix_shape}, got {matrix.shape}")
         power = _validated_parameter_power(term.parameter_power)
-        _add_powered_dense_block(operator_blocks, power, np.kron(matrix, basis_by_type[term.basis_type]))
+        _add_powered_sparse_block(
+            operator_blocks,
+            power,
+            sparse.kron(matrix, basis_by_type[term.basis_type], format="csc"),
+        )
 
     forcing_blocks: dict[float, NDArray[np.float64]] = {}
     forcing_terms = tuple(model.forcing_terms(t))
@@ -593,17 +599,22 @@ def _prepare_structured_parameter_blocks(
     return operator_blocks, forcing_blocks
 
 
-def _as_dense_matrix(matrix: NDArray[np.float64] | sparse.spmatrix) -> NDArray[np.float64]:
-    if sparse.issparse(matrix):
-        return np.asarray(matrix.toarray(), dtype=np.float64)
-    return np.asarray(matrix, dtype=np.float64)
-
-
 def _validated_parameter_power(power: float) -> float:
     value = float(power)
     if not np.isfinite(value):
         raise ValueError(f"parameter_power must be finite, got {power!r}")
     return value
+
+
+def _add_powered_sparse_block(
+    blocks: dict[float, sparse.csc_matrix],
+    power: float,
+    block: sparse.csc_matrix,
+) -> None:
+    if power in blocks:
+        blocks[power] = (blocks[power] + block).tocsc()
+    else:
+        blocks[power] = block
 
 
 def _add_powered_dense_block(
@@ -615,6 +626,27 @@ def _add_powered_dense_block(
         blocks[power] = blocks[power] + block
     else:
         blocks[power] = block
+
+
+def _combine_powered_sparse_blocks(
+    blocks: dict[float, sparse.csc_matrix],
+    parameter: float,
+    *,
+    derivative: bool = False,
+) -> sparse.csc_matrix:
+    if not blocks:
+        raise ValueError("at least one parameter block is required")
+    active_parameter = float(parameter)
+    result: sparse.csc_matrix | None = None
+    for power, block in blocks.items():
+        scale = _parameter_derivative_scale(active_parameter, power) if derivative else active_parameter**power
+        if scale == 0.0:
+            continue
+        contribution = block * scale
+        result = contribution if result is None else result + contribution
+    if result is None:
+        return sparse.csc_matrix(next(iter(blocks.values())).shape, dtype=np.float64)
+    return result.tocsc()
 
 
 def _combine_powered_dense_blocks(
@@ -642,3 +674,19 @@ def _parameter_derivative_scale(parameter: float, power: float) -> float:
     if power == 0.0:
         return 0.0
     return power * parameter ** (power - 1.0)
+
+
+def _solve_sparse(matrix: sparse.spmatrix, rhs: NDArray[np.float64]) -> NDArray[np.float64]:
+    return splu(matrix.tocsc()).solve(np.asarray(rhs, dtype=np.float64))
+
+
+def _augmented_arc_matrix(
+    jacobian: sparse.spmatrix,
+    parameter_column: NDArray[np.float64],
+    arc_row: NDArray[np.float64],
+) -> sparse.csc_matrix:
+    size = jacobian.shape[0]
+    parameter_sparse = sparse.csc_matrix(np.asarray(parameter_column, dtype=np.float64).reshape(size, 1))
+    arc_sparse = sparse.csr_matrix(np.asarray(arc_row, dtype=np.float64).reshape(1, size + 1))
+    top = sparse.hstack((-jacobian, parameter_sparse), format="csc")
+    return sparse.vstack((top, arc_sparse), format="csc")

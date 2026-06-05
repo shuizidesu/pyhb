@@ -24,7 +24,6 @@ DEFAULT_OUTPUT = Path("results/example_aeroengine_arc.npz")
 DEFAULT_MAX_STEPS = 400
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 0.1
-DEFAULT_HARMONIC_PRESET = "condensed_aligned"
 INIT_OMEGA = 145.0
 MAX_EPOCH = 25
 INITIAL_SCALE = 1e-5
@@ -104,7 +103,6 @@ def save_result(result: ContinuationResult, args: argparse.Namespace, plot_dofs:
         "nonlinear_harmonics": result.nonlinear_harmonics,
         "frequency_resolution": np.array(result.frequency_resolution),
         "period": np.array(result.period),
-        "harmonic_preset": np.array(DEFAULT_HARMONIC_PRESET),
         "plot_dofs": np.asarray(plot_dofs, dtype=np.int64),
     }
     if args.save_coeff_history:
