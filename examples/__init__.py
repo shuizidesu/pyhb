@@ -1,1 +1,1 @@
-"""Runnable examples for the EGA-IHB package."""
+"""Runnable examples for the pyHB package."""

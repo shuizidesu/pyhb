@@ -1,4 +1,4 @@
-"""Model interfaces for EGA-IHB solvers."""
+"""Model interfaces for pyHB solvers."""
 
 from __future__ import annotations
 

@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ega_ihb import (
+from pyhb import (
     ContinuationConfig,
     ContinuationResult,
     ContinuationSolver,
@@ -43,7 +43,7 @@ HARMONICS = harmonic_range(0.5, 3.1, 0.1)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the aero-engine rotor EGA-IHB arc-length example.")
+    parser = argparse.ArgumentParser(description="Run the aero-engine rotor pyHB arc-length example.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--sample-fft", type=int, default=DEFAULT_SAMPLE_FFT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)

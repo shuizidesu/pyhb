@@ -1,10 +1,9 @@
-"""Generic EGA-IHB harmonic-balance tools for nonlinear dynamics."""
+"""Generic pyHB harmonic-balance tools for nonlinear dynamics."""
 
 from .continuation import ContinuationConfig, ContinuationResult, ContinuationSolver
 from .condensed_continuation import (
     CondensedContinuationConfig,
     CondensedContinuationLog,
-    CondensedContinuationLoopEvent,
     CondensedContinuationResult,
     CondensedContinuationSolver,
 )
@@ -26,7 +25,6 @@ _AUTODIFF_EXPORTS = {
 __all__ = [
     "CondensedContinuationConfig",
     "CondensedContinuationLog",
-    "CondensedContinuationLoopEvent",
     "CondensedContinuationResult",
     "CondensedContinuationSolver",
     "AutodiffSecondOrderTimeModel",
@@ -55,4 +53,4 @@ def __getattr__(name: str):
             "ContinuationAutodiffSolver": ContinuationAutodiffSolver,
         }
         return values[name]
-    raise AttributeError(f"module 'ega_ihb' has no attribute {name!r}")
+    raise AttributeError(f"module 'pyhb' has no attribute {name!r}")

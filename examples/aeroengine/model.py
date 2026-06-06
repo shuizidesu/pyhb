@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.io import loadmat
 
-from ega_ihb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
+from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
 
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"

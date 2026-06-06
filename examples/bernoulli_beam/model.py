@@ -8,7 +8,7 @@ import torch
 from numpy.typing import NDArray
 from scipy.io import loadmat
 
-from ega_ihb import AutodiffSecondOrderTimeModel, ForcingTerm, LinearOperatorTerm
+from pyhb import AutodiffSecondOrderTimeModel, ForcingTerm, LinearOperatorTerm
 
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "beam_parameter_matrix.mat"

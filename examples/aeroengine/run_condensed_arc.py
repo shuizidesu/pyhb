@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ega_ihb import CondensedContinuationConfig, CondensedContinuationResult, CondensedContinuationSolver
+from pyhb import CondensedContinuationConfig, CondensedContinuationResult, CondensedContinuationSolver
 from examples.aeroengine.model import AeroEngineRotorModel
 
 
@@ -23,7 +23,7 @@ def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
 HARMONICS = harmonic_range(0.5, 3.1, 0.1)
 FREQUENCY_RESOLUTION = 0.1
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "condensed_arc.npz"
-DEFAULT_SAMPLE_FFT = 2**11
+DEFAULT_SAMPLE_FFT = 2 ** 11
 DEFAULT_MAX_STEPS = 400
 DEFAULT_PLOT_DOFS = (34, 176, 68, 210)
 INIT_OMEGA = 145.0
@@ -32,7 +32,6 @@ RES_TOLERANCE = 1e-9
 DELTA_TOLERANCE = 1e-12
 Q_SCALE = 1e-4
 OMEGA_SCALE = 200
-LOOP_SWITCH_ENABLED = True
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,9 +56,6 @@ def build_config(args: argparse.Namespace, init_omega: float = INIT_OMEGA) -> Co
         s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
-        loop_switch_enabled=LOOP_SWITCH_ENABLED,
-        loop_revisit_tolerance=0.01,
-        loop_restart_omega_delta=0.5,
         max_steps=args.max_steps,
         progress_callback=print,
     )

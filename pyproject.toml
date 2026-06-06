@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ega-ihb"
+name = "pyhb"
 version = "0.1.0"
-description = "EGA-IHB harmonic-balance tools for nonlinear dynamic response analysis."
+description = "pyHB harmonic-balance tools for nonlinear dynamic response analysis."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -25,7 +25,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["ega_ihb*"]
+include = ["pyhb*"]
 
 [tool.ruff]
 line-length = 120

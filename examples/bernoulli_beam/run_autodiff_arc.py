@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ega_ihb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
+from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
 from examples.bernoulli_beam.model import BernoulliBeamAutodiffModel
 
 
