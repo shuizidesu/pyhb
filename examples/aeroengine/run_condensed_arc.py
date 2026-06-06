@@ -7,12 +7,12 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb import CondensedContinuationConfig, CondensedContinuationResult, CondensedContinuationSolver
-from examples.aeroengine_model import AeroEngineRotorModel
+from examples.aeroengine.model import AeroEngineRotorModel
 
 
 def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
@@ -22,7 +22,7 @@ def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
 
 HARMONICS = harmonic_range(0.5, 3.1, 0.1)
 FREQUENCY_RESOLUTION = 0.1
-DEFAULT_OUTPUT = Path("results/example_aeroengine_condensed_arc.npz")
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "condensed_arc.npz"
 DEFAULT_SAMPLE_FFT = 2**11
 DEFAULT_MAX_STEPS = 400
 DEFAULT_PLOT_DOFS = (34, 176, 68, 210)

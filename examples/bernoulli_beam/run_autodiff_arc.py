@@ -7,38 +7,31 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
-from examples.aeroengine_autodiff_model import AeroEngineAutodiffRotorModel
+from examples.bernoulli_beam.model import BernoulliBeamAutodiffModel
 
 
-DEFAULT_OUTPUT = Path("results/example_aeroengine_autodiff_arc.npz")
-DEFAULT_MAX_STEPS = 800
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
+DEFAULT_MAX_STEPS = 250
 DEFAULT_SAMPLE_FFT = 2 ** 11
-FREQUENCY_RESOLUTION = 0.1
-INIT_OMEGA = 145.0
+FREQUENCY_RESOLUTION = 1.0
+INIT_OMEGA = 4.0
 MAX_EPOCH = 25
-INITIAL_SCALE = 1e-5
-RES_TOLERANCE = 1e-9
-DELTA_TOLERANCE = 1e-12
-Q_SCALE = 1e-4
-OMEGA_SCALE = 100.0
-DEFAULT_PLOT_DOFS = (34, 176, 68, 210)
-
-
-def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
-    count = int(round((stop - start) / step)) + 1
-    return tuple(round(start + step * index, 10) for index in range(count))
-
-
-HARMONICS = harmonic_range(0.5, 3.1, 0.1)
+INITIAL_SCALE = 1e-2
+RES_TOLERANCE = 1e-4
+DELTA_TOLERANCE = 1e-5
+Q_SCALE = 1.0
+OMEGA_SCALE = 5.0
+HARMONICS = tuple(float(value) for value in range(1, 6))
+DEFAULT_PLOT_DOFS = (1998,)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the autodiff aero-engine rotor arc-length example.")
+    parser = argparse.ArgumentParser(description="Run the Bernoulli beam autodiff arc-length example.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--sample-fft", type=int, default=DEFAULT_SAMPLE_FFT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -66,9 +59,10 @@ def build_config(args: argparse.Namespace) -> ContinuationAutodiffConfig:
     )
 
 
-def build_initial_coefficients(model: AeroEngineAutodiffRotorModel, order: int) -> NDArray[np.float64]:
+def build_initial_coefficients(model: BernoulliBeamAutodiffModel, order: int) -> NDArray[np.float64]:
     rng = np.random.default_rng(0)
-    return rng.random((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
+    initial = rng.standard_normal((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
+    return initial
 
 
 def save_result(result: ContinuationResult, output: Path) -> None:
@@ -82,7 +76,7 @@ def save_result(result: ContinuationResult, output: Path) -> None:
 
 
 def run_from_args(args: argparse.Namespace) -> None:
-    model = AeroEngineAutodiffRotorModel()
+    model = BernoulliBeamAutodiffModel()
     config = build_config(args)
     order = 2 * len(HARMONICS) + 1
     initial_coefficients = build_initial_coefficients(model, order)

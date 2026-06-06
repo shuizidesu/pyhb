@@ -7,15 +7,15 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb import ContinuationConfig, ContinuationResult, ContinuationSolver
-from examples.four_dof_fractional_model import FourDofFractionalModel
+from examples.four_dof_fractional.model import FourDofFractionalModel
 
 
-DEFAULT_OUTPUT = Path("results/example_4dof_fractional_arc.npz")
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
 DEFAULT_MAX_STEPS = 290
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 0.2

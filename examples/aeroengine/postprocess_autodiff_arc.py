@@ -7,21 +7,21 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb.harmonics import generate_hb_items
-from examples.example_4dof_fractional_arc import DEFAULT_PLOT_DOFS, FRACTIONAL_HARMONICS, FREQUENCY_RESOLUTION
+from examples.aeroengine.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
 
 
-DEFAULT_INPUT = Path("results/example_4dof_fractional_arc.npz")
-DEFAULT_OUTPUT = Path("results/example_4dof_fractional_arc.png")
+DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
 DEFAULT_SAMPLE_COUNT = 4096
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Postprocess the 4DOF fractional-harmonic continuation result.")
+    parser = argparse.ArgumentParser(description="Postprocess the autodiff aero-engine continuation result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
@@ -37,7 +37,7 @@ def compute_rms_history(
 ) -> NDArray[np.float64]:
     period = 2.0 * np.pi / FREQUENCY_RESOLUTION
     t = np.arange(sample_count, dtype=np.float64) * (period / sample_count)
-    hb_item, _, _ = generate_hb_items(t, FRACTIONAL_HARMONICS)
+    hb_item, _, _ = generate_hb_items(t, HARMONICS)
     selected_coefficients = coefficient_history[:, :, list(dofs)]
     response = np.einsum("to,sod->std", hb_item, selected_coefficients)
     return np.sqrt(np.mean(response * response, axis=1))

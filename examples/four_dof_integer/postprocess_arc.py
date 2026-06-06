@@ -7,21 +7,21 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from ega_ihb.harmonics import generate_hb_items
-from examples.example_aeroengine_condensed_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
+from examples.four_dof_integer.run_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
 
 
-DEFAULT_INPUT = Path("results/example_aeroengine_condensed_arc.npz")
-DEFAULT_OUTPUT = Path("results/example_aeroengine_condensed_arc.png")
+DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.png"
 DEFAULT_SAMPLE_COUNT = 4096
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Postprocess the condensed aero-engine continuation result.")
+    parser = argparse.ArgumentParser(description="Postprocess the 4DOF integer-harmonic continuation result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
