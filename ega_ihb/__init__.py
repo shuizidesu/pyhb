@@ -10,6 +10,7 @@ from .condensed_continuation import (
 )
 from .hb_operators import FrequencyGrid, build_full_fft_nonlinear_harmonics, build_quadratic_nonlinear_harmonics
 from .models import (
+    AutodiffSecondOrderTimeModel,
     ForcingTerm,
     LinearOperatorTerm,
     LocalNonlinearJacobianTerm,
@@ -17,12 +18,20 @@ from .models import (
     SecondOrderTimeModel,
 )
 
+_AUTODIFF_EXPORTS = {
+    "ContinuationAutodiffConfig",
+    "ContinuationAutodiffSolver",
+}
+
 __all__ = [
     "CondensedContinuationConfig",
     "CondensedContinuationLog",
     "CondensedContinuationLoopEvent",
     "CondensedContinuationResult",
     "CondensedContinuationSolver",
+    "AutodiffSecondOrderTimeModel",
+    "ContinuationAutodiffConfig",
+    "ContinuationAutodiffSolver",
     "ContinuationConfig",
     "ContinuationResult",
     "ContinuationSolver",
@@ -35,3 +44,15 @@ __all__ = [
     "build_full_fft_nonlinear_harmonics",
     "build_quadratic_nonlinear_harmonics",
 ]
+
+
+def __getattr__(name: str):
+    if name in _AUTODIFF_EXPORTS:
+        from .continuation_autodiff import ContinuationAutodiffConfig, ContinuationAutodiffSolver
+
+        values = {
+            "ContinuationAutodiffConfig": ContinuationAutodiffConfig,
+            "ContinuationAutodiffSolver": ContinuationAutodiffSolver,
+        }
+        return values[name]
+    raise AttributeError(f"module 'ega_ihb' has no attribute {name!r}")

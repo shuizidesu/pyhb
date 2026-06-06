@@ -17,6 +17,9 @@ dependencies = [
 examples = [
     "matplotlib",
 ]
+autodiff = [
+    "torch",
+]
 dev = [
     "ruff",
 ]

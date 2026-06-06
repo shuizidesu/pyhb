@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -312,3 +312,89 @@ def _extract_local_states(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     indices = list(coordinate_dofs)
     return x[:, indices], dx[:, indices], ddx[:, indices]
+
+
+class AutodiffSecondOrderTimeModel(SecondOrderTimeModel):
+    """Second-order model whose local nonlinear derivatives are built by Torch autodiff."""
+
+    @property
+    def autodiff_variables(self) -> tuple[JacobianVariable, ...]:
+        """Variables whose local nonlinear Jacobian terms should be differentiated."""
+
+        return ("x",)
+
+    @property
+    def autodiff_parameter_dependent(self) -> bool:
+        """Whether the local nonlinear force has explicit continuation-parameter dependence."""
+
+        return False
+
+    @abstractmethod
+    def local_nonlinear_force_torch(
+        self,
+        t: Any,
+        local_x: Any,
+        local_dx: Any,
+        local_ddx: Any,
+        parameter: Any,
+    ) -> Any:
+        """Return local nonlinear force samples as a Torch tensor.
+
+        Inputs are batched by time sample. Shapes are ``t=(samples,)`` and
+        ``local_x/local_dx/local_ddx=(samples, coordinate_count)``. The return
+        value must be shaped ``(samples, force_count)``.
+        """
+
+    def local_nonlinear_force(
+        self,
+        t: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
+        parameter: float,
+    ) -> NDArray[np.float64]:
+        """Evaluate local nonlinear force through the Torch implementation."""
+
+        import torch
+
+        device = torch.device("cpu")
+        with torch.no_grad():
+            t_tensor = torch.as_tensor(t, dtype=torch.float64, device=device)
+            x_tensor = torch.as_tensor(local_x, dtype=torch.float64, device=device)
+            dx_tensor = torch.as_tensor(local_dx, dtype=torch.float64, device=device)
+            ddx_tensor = torch.as_tensor(local_ddx, dtype=torch.float64, device=device)
+            parameter_tensor = torch.as_tensor(float(parameter), dtype=torch.float64, device=device)
+            force = self.local_nonlinear_force_torch(
+                t_tensor,
+                x_tensor,
+                dx_tensor,
+                ddx_tensor,
+                parameter_tensor,
+            )
+        return np.asarray(force.detach().cpu().numpy(), dtype=np.float64)
+
+    def local_nonlinear_jacobian_terms(
+        self,
+        t: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
+        parameter: float,
+    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+        """Autodiff models do not expose handwritten nonlinear Jacobian terms."""
+
+        raise NotImplementedError("use ContinuationAutodiffSolver for AutodiffSecondOrderTimeModel")
+
+    def local_nonlinear_parameter_derivative(
+        self,
+        t: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
+        parameter: float,
+    ) -> NDArray[np.float64]:
+        """Autodiff models only expose explicit parameter derivatives through the autodiff solver."""
+
+        if not self.autodiff_parameter_dependent:
+            return np.zeros((t.size, len(self.nonlinear_force_dofs)), dtype=np.float64)
+        raise NotImplementedError("use ContinuationAutodiffSolver for parameter-dependent autodiff nonlinearities")
