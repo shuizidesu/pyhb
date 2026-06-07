@@ -11,11 +11,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
-from examples.bernoulli_beam.autodiff_model import BernoulliBeamAutodiffModel
+from pyhb import CondensedContinuationConfig, CondensedContinuationResult, CondensedContinuationSolver
+from examples.bernoulli_beam.model import BernoulliBeamModel
 
 
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "condensed_arc.npz"
 DEFAULT_MAX_STEPS = 250
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 1.0
@@ -23,7 +23,7 @@ INIT_OMEGA = 4.0
 MAX_EPOCH = 25
 INITIAL_SCALE = 1e-2
 RES_TOLERANCE = 1e-4
-DELTA_TOLERANCE = 1e-5
+DELTA_TOLERANCE = 1e-4
 Q_SCALE = 1.0
 OMEGA_SCALE = 5.0
 HARMONICS = tuple(float(value) for value in range(1, 6))
@@ -31,16 +31,15 @@ DEFAULT_PLOT_DOFS = (1998,)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Bernoulli beam autodiff arc-length example.")
+    parser = argparse.ArgumentParser(description="Run the condensed Bernoulli beam arc-length example.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--sample-fft", type=int, default=DEFAULT_SAMPLE_FFT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--torch-device", type=str, default=None)
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> ContinuationAutodiffConfig:
-    return ContinuationAutodiffConfig(
+def build_config(args: argparse.Namespace) -> CondensedContinuationConfig:
+    return CondensedContinuationConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
@@ -48,24 +47,27 @@ def build_config(args: argparse.Namespace) -> ContinuationAutodiffConfig:
         max_epoch=MAX_EPOCH,
         res_tolerance=RES_TOLERANCE,
         delta_tolerance=DELTA_TOLERANCE,
-        s_initial=0.1,
-        s_max=0.3,
+        s_initial=0.05,
+        s_max=0.1,
         s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
         max_steps=args.max_steps,
         progress_callback=print,
-        torch_device=args.torch_device,
     )
 
 
-def build_initial_coefficients(model: BernoulliBeamAutodiffModel, order: int) -> NDArray[np.float64]:
+def build_full_initial_coefficients(model: BernoulliBeamModel, order: int) -> NDArray[np.float64]:
     rng = np.random.default_rng(0)
-    initial = rng.standard_normal((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
-    return initial
+    return rng.standard_normal((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
 
 
-def save_result(result: ContinuationResult, output: Path) -> None:
+def build_initial_coefficients(model: BernoulliBeamModel, order: int, nonlinear_dofs: tuple[int, ...]) -> NDArray[np.float64]:
+    full_initial = build_full_initial_coefficients(model, order)
+    return full_initial[:, list(nonlinear_dofs)].copy()
+
+
+def save_result(result: CondensedContinuationResult, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         output,
@@ -76,11 +78,14 @@ def save_result(result: ContinuationResult, output: Path) -> None:
 
 
 def run_from_args(args: argparse.Namespace) -> None:
-    model = BernoulliBeamAutodiffModel()
-    config = build_config(args)
-    order = 2 * len(HARMONICS) + 1
-    initial_coefficients = build_initial_coefficients(model, order)
-    result = ContinuationAutodiffSolver(model, config).run(initial_coefficients=initial_coefficients)
+    model = BernoulliBeamModel()
+    solver = CondensedContinuationSolver(model, build_config(args))
+    initial_coefficients = build_initial_coefficients(
+        model,
+        solver.prepared.context.order,
+        solver.prepared.nonlinear_dofs,
+    )
+    result = solver.run(initial_coefficients)
     save_result(result, args.output)
 
 

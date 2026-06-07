@@ -11,11 +11,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
-from examples.bernoulli_beam.autodiff_model import BernoulliBeamAutodiffModel
+from pyhb import ContinuationConfig, ContinuationResult, ContinuationSolver
+from examples.bernoulli_beam.model import BernoulliBeamModel
 
 
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
 DEFAULT_MAX_STEPS = 250
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 1.0
@@ -31,16 +31,15 @@ DEFAULT_PLOT_DOFS = (1998,)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the Bernoulli beam autodiff arc-length example.")
+    parser = argparse.ArgumentParser(description="Run the Bernoulli beam full arc-length example.")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
     parser.add_argument("--sample-fft", type=int, default=DEFAULT_SAMPLE_FFT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--torch-device", type=str, default=None)
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> ContinuationAutodiffConfig:
-    return ContinuationAutodiffConfig(
+def build_config(args: argparse.Namespace) -> ContinuationConfig:
+    return ContinuationConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
@@ -55,14 +54,12 @@ def build_config(args: argparse.Namespace) -> ContinuationAutodiffConfig:
         omega_scale=OMEGA_SCALE,
         max_steps=args.max_steps,
         progress_callback=print,
-        torch_device=args.torch_device,
     )
 
 
-def build_initial_coefficients(model: BernoulliBeamAutodiffModel, order: int) -> NDArray[np.float64]:
+def build_initial_coefficients(model: BernoulliBeamModel, order: int) -> NDArray[np.float64]:
     rng = np.random.default_rng(0)
-    initial = rng.standard_normal((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
-    return initial
+    return rng.standard_normal((order, model.n_dof), dtype=np.float64) * INITIAL_SCALE
 
 
 def save_result(result: ContinuationResult, output: Path) -> None:
@@ -76,11 +73,11 @@ def save_result(result: ContinuationResult, output: Path) -> None:
 
 
 def run_from_args(args: argparse.Namespace) -> None:
-    model = BernoulliBeamAutodiffModel()
+    model = BernoulliBeamModel()
     config = build_config(args)
     order = 2 * len(HARMONICS) + 1
     initial_coefficients = build_initial_coefficients(model, order)
-    result = ContinuationAutodiffSolver(model, config).run(initial_coefficients=initial_coefficients)
+    result = ContinuationSolver(model, config).run(initial_coefficients=initial_coefficients)
     save_result(result, args.output)
 
 
