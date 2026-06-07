@@ -179,34 +179,6 @@ def harmonic_integral_matrices(harmonics: ArrayLike) -> tuple[NDArray[np.float64
     return mass_basis, damping_basis, stiffness_basis
 
 
-def linear_jacobian_parts(
-    mass: ArrayLike,
-    damping: ArrayLike,
-    stiffness: ArrayLike,
-    harmonics: ArrayLike,
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Return HB Jacobian blocks for ``M*xdd + C*xd + K*x`` terms."""
-
-    basis_m, basis_c, basis_k = harmonic_integral_matrices(harmonics)
-    return (
-        np.kron(np.asarray(mass, dtype=np.float64), basis_m),
-        np.kron(np.asarray(damping, dtype=np.float64), basis_c),
-        np.kron(np.asarray(stiffness, dtype=np.float64), basis_k),
-    )
-
-
-def linear_jacobian(
-    mass: ArrayLike,
-    damping: ArrayLike,
-    stiffness: ArrayLike,
-    harmonics: ArrayLike,
-) -> NDArray[np.float64]:
-    """Return the full linear HB Jacobian."""
-
-    j_m, j_c, j_k = linear_jacobian_parts(mass, damping, stiffness, harmonics)
-    return j_m + j_c + j_k
-
-
 def integrate_s3(
     harmonics: ArrayLike,
     nonlinear_harmonics: ArrayLike,
@@ -306,35 +278,9 @@ def compute_s3(
     raise ValueError(f"unsupported s3_method {method!r}; expected 'fast' or 'quad'")
 
 
-def build_quadratic_nonlinear_harmonics(
-    harmonics: ArrayLike,
-    frequency_resolution: float,
-    max_harmonic: float,
-    *,
-    tolerance: float = 1e-10,
-) -> tuple[float, ...]:
-    """Build nonzero sum/difference frequencies from a harmonic list."""
-
-    grid = FrequencyGrid(frequency_resolution, tolerance)
-    values = np.asarray(harmonics, dtype=np.float64).reshape(-1)
-    grid.indices_for(values)
-    bins: set[int] = set()
-    max_bin = grid.indices_for([max_harmonic])[0]
-    for hi in values:
-        for hj in values:
-            for candidate in (abs(hi - hj), hi + hj):
-                if candidate <= tolerance:
-                    continue
-                index = grid.indices_for([candidate])[0]
-                if index <= max_bin:
-                    bins.add(index)
-    return tuple(index * frequency_resolution for index in sorted(bins))
-
-
 def build_full_fft_nonlinear_harmonics(sample_count: int, frequency_resolution: float) -> tuple[float, ...]:
     """Return all positive FFT-bin harmonic values through Nyquist."""
 
     if sample_count < 2:
         raise ValueError("sample_count must be at least 2")
     return tuple(float(frequency_resolution) * index for index in range(1, int(sample_count) // 2 + 1))
-

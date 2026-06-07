@@ -7,7 +7,7 @@ from .condensed_continuation import (
     CondensedContinuationResult,
     CondensedContinuationSolver,
 )
-from .hb_operators import FrequencyGrid, build_full_fft_nonlinear_harmonics, build_quadratic_nonlinear_harmonics
+from .hb_operators import FrequencyGrid, build_full_fft_nonlinear_harmonics
 from .models import (
     AutodiffSecondOrderTimeModel,
     ForcingTerm,
@@ -40,7 +40,6 @@ __all__ = [
     "NonlinearJacobianTerm",
     "SecondOrderTimeModel",
     "build_full_fft_nonlinear_harmonics",
-    "build_quadratic_nonlinear_harmonics",
 ]
 
 

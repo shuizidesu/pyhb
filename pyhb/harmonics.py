@@ -40,33 +40,6 @@ def generate_hb_items(tau: ArrayLike, harmonics: ArrayLike) -> tuple[NDArray[np.
     return item, item_dt, item_ddt
 
 
-def coefficient_vector_from_fft(
-    values: ArrayLike,
-    harmonics: ArrayLike,
-    sample_count: int | None = None,
-    harmonic_indices: ArrayLike | None = None,
-) -> NDArray[np.float64]:
-    """Extract MATLAB-style Fourier coefficients from samples.
-
-    MATLAB code uses ``fft(values) * 2 / sampleFFT`` and then stacks
-    ``[real(fft[0])/2, real(fft[h]), -imag(fft[h])]``.
-    """
-
-    samples = np.asarray(values)
-    if samples.ndim != 1:
-        samples = samples.reshape(-1)
-    n = int(sample_count if sample_count is not None else samples.size)
-    hb = np.asarray(harmonic_indices if harmonic_indices is not None else harmonics, dtype=np.int64).reshape(-1)
-    fft_values = np.fft.fft(samples) * (2.0 / n)
-    return np.concatenate(
-        (
-            np.array([fft_values[0].real / 2.0], dtype=np.float64),
-            fft_values[hb].real.astype(np.float64),
-            (-fft_values[hb].imag).astype(np.float64),
-        )
-    )
-
-
 def coefficient_matrix_from_fft(
     values: ArrayLike,
     harmonics: ArrayLike,
@@ -76,8 +49,8 @@ def coefficient_matrix_from_fft(
     """Extract nonlinear-Jacobian Fourier coefficients for many terms.
 
     The input is shaped ``(samples, n_terms)`` and the output is shaped
-    ``(2 * n_harmonics + 1, n_terms)``. The DC row follows
-    :func:`coefficient_vector_from_fft` and is halved.
+    ``(2 * n_harmonics + 1, n_terms)``. The DC row is halved to match
+    nonlinear Jacobian projection conventions.
     """
 
     samples = np.asarray(values)
@@ -105,8 +78,8 @@ def stack_fft_coefficients(
 
     This follows ``CalculateRes.m`` and the arc-length ``J_lambda`` assembly:
     the DC row is ``real(fft[0])`` after the ``2 / sampleFFT`` scaling, not
-    ``real(fft[0]) / 2``. Nonlinear Jacobian helper coefficients use
-    :func:`coefficient_vector_from_fft`, which intentionally halves the DC term.
+    ``real(fft[0]) / 2``. Nonlinear Jacobian coefficient matrices intentionally
+    halve the DC term instead.
     """
 
     values = np.asarray(sample_by_dof)
