@@ -35,6 +35,7 @@ class ContinuationConfig:
     omega_scale: float = 1.0
     max_steps: int = 500
     shrink_limit: int = 20
+    residual_floor: float = 1e-16
     progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
 
@@ -47,6 +48,7 @@ class StepLog:
     omega: float
     arc_length: float
     converged: bool
+    relative_residual: float = np.inf
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,12 @@ class _PreparedProblem:
     forcing_blocks: dict[float, NDArray[np.float64]]
 
 
+@dataclass(frozen=True)
+class _ResidualStats:
+    relative_residual: float
+    max_residual: float
+
+
 class ContinuationSolver:
     """Generic single-parameter arc-length continuation solver."""
 
@@ -83,6 +91,7 @@ class ContinuationSolver:
         self.config = config or ContinuationConfig()
         _validate_positive_scale("q_scale", self.config.q_scale)
         _validate_positive_scale("omega_scale", self.config.omega_scale)
+        _validate_positive_scale("residual_floor", self.config.residual_floor)
         self.prepared = self._prepare()
 
     def _prepare(self) -> _PreparedProblem:
@@ -157,6 +166,16 @@ class ContinuationSolver:
         ddx: NDArray[np.float64],
         parameter: float,
     ) -> NDArray[np.float64]:
+        return self._residual_terms(coeff_line, x, dx, ddx, parameter)[0]
+
+    def _residual_terms(
+        self,
+        coeff_line: NDArray[np.float64],
+        x: NDArray[np.float64],
+        dx: NDArray[np.float64],
+        ddx: NDArray[np.float64],
+        parameter: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
         model = self.model
         nonlinear_coefficients = stack_fft_coefficients(
             model.nonlinear_force(self.prepared.t, x, dx, ddx, parameter),
@@ -164,7 +183,10 @@ class ContinuationSolver:
             self.config.sample_fft,
             self.prepared.context.harmonic_indices,
         )
-        return self._forcing_coefficients(parameter) - nonlinear_coefficients - self._linear_jacobian(parameter) @ coeff_line
+        forcing_coefficients = self._forcing_coefficients(parameter)
+        linear_coefficients = self._linear_jacobian(parameter) @ coeff_line
+        residual = forcing_coefficients - nonlinear_coefficients - linear_coefficients
+        return residual, forcing_coefficients, nonlinear_coefficients, linear_coefficients
 
     def _jacobian(
         self,
@@ -276,18 +298,21 @@ class ContinuationSolver:
         config = self.config
         epoch = 1
         residual_vector = np.full(coeff_line.shape, np.inf, dtype=np.float64)
+        residual_stats = _ResidualStats(np.inf, np.inf)
         delta = np.full(coeff_line.shape, np.inf, dtype=np.float64)
         coeff = x = dx = ddx = None
         jacobian = None
 
         while (
             epoch < config.max_epoch
-            and np.max(np.abs(residual_vector)) >= config.res_tolerance
+            and residual_stats.relative_residual >= config.res_tolerance
             and np.max(np.abs(delta)) >= config.delta_tolerance
         ):
             coeff, x, dx, ddx = self._evaluate_state(coeff_line)
             jacobian = self._jacobian(x, dx, ddx, parameter)
-            residual_vector = self._residual(coeff_line, x, dx, ddx, parameter)
+            residual_terms = self._residual_terms(coeff_line, x, dx, ddx, parameter)
+            residual_vector = residual_terms[0]
+            residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
             delta = _solve_sparse(jacobian, residual_vector)
             coeff_line = coeff_line + delta
             epoch += 1
@@ -297,12 +322,13 @@ class ContinuationSolver:
         log = StepLog(
             step=0,
             epoch=epoch,
-            max_residual=float(np.max(np.abs(residual_vector))),
+            relative_residual=residual_stats.relative_residual,
+            max_residual=residual_stats.max_residual,
             max_delta=float(np.max(np.abs(delta))),
             omega=float(parameter),
             arc_length=0.0,
             converged=bool(
-                np.max(np.abs(residual_vector)) < config.res_tolerance
+                residual_stats.relative_residual < config.res_tolerance
                 or np.max(np.abs(delta)) < config.delta_tolerance
             ),
         )
@@ -354,7 +380,8 @@ class ContinuationSolver:
         coeff_line, coeff, x, dx, jacobian, initial_log = self._solve_initial(coeff_line, parameter)
         self._emit_progress(
             "Initial computation, "
-            f"Epoch = {initial_log.epoch}, Res = {initial_log.max_residual:.6e}, "
+            f"Epoch = {initial_log.epoch}, RelRes = {initial_log.relative_residual:.6e}, "
+            f"MaxRes = {initial_log.max_residual:.6e}, "
             f"Delta = {initial_log.max_delta:.6e}, Omega = {initial_log.omega:.10g}"
         )
         _, _, _, ddx = self._evaluate_state(coeff_line)
@@ -374,17 +401,20 @@ class ContinuationSolver:
             coeff_line = y[:-1].copy()
             parameter = float(y[-1])
             residual_vector = np.full(self.model.n_dof * order, np.inf, dtype=np.float64)
+            residual_stats = _ResidualStats(np.inf, np.inf)
             delta = np.full(self.model.n_dof * order + 1, np.inf, dtype=np.float64)
             j_arc_lu = None
 
             while (
                 epoch < config.max_epoch
-                and np.max(np.abs(residual_vector)) >= config.res_tolerance
+                and residual_stats.relative_residual >= config.res_tolerance
                 and np.max(np.abs(delta)) >= config.delta_tolerance
             ):
                 coeff, x, dx, ddx = self._evaluate_state(coeff_line)
                 jacobian = self._jacobian(x, dx, ddx, parameter)
-                residual_vector = self._residual(coeff_line, x, dx, ddx, parameter)
+                residual_terms = self._residual_terms(coeff_line, x, dx, ddx, parameter)
+                residual_vector = residual_terms[0]
+                residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
                 j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
                 r_arc = np.concatenate(
                     (
@@ -403,14 +433,23 @@ class ContinuationSolver:
                 parameter = float(y[-1])
                 epoch += 1
 
-            max_res = float(np.max(np.abs(residual_vector)))
             max_delta = float(np.max(np.abs(delta)))
-            converged = max_res <= config.res_tolerance or max_delta <= config.delta_tolerance
-            step_log = StepLog(step, epoch, max_res, max_delta, float(parameter), float(arc_length_step), bool(converged))
+            converged = residual_stats.relative_residual <= config.res_tolerance or max_delta <= config.delta_tolerance
+            step_log = StepLog(
+                step=step,
+                epoch=epoch,
+                max_residual=residual_stats.max_residual,
+                max_delta=max_delta,
+                omega=float(parameter),
+                arc_length=float(arc_length_step),
+                converged=bool(converged),
+                relative_residual=residual_stats.relative_residual,
+            )
             logs.append(step_log)
             status = "ok" if step_log.converged else "no convergence"
             self._emit_progress(
-                f"Times = {step_log.step}, Epoch = {step_log.epoch}, Res = {step_log.max_residual:.6e}, "
+                f"Times = {step_log.step}, Epoch = {step_log.epoch}, RelRes = {step_log.relative_residual:.6e}, "
+                f"MaxRes = {step_log.max_residual:.6e}, "
                 f"Delta = {step_log.max_delta:.6e}, Omega = {step_log.omega:.10g}, "
                 f"s = {step_log.arc_length:.6g}, {status}"
             )
@@ -603,6 +642,26 @@ def _parameter_derivative_scale(parameter: float, power: float) -> float:
 
 def _solve_sparse(matrix: sparse.spmatrix, rhs: NDArray[np.float64]) -> NDArray[np.float64]:
     return splu(matrix.tocsc()).solve(np.asarray(rhs, dtype=np.float64))
+
+
+def _rms(values: NDArray[np.float64]) -> float:
+    vector = np.asarray(values, dtype=np.float64).reshape(-1)
+    if vector.size == 0:
+        return 0.0
+    return float(np.linalg.norm(vector) / np.sqrt(vector.size))
+
+
+def _residual_stats(
+    residual: NDArray[np.float64],
+    scale_terms: tuple[NDArray[np.float64], ...],
+    residual_floor: float,
+) -> _ResidualStats:
+    scale = max((_rms(term) for term in scale_terms), default=0.0)
+    scale = max(scale, float(residual_floor))
+    return _ResidualStats(
+        relative_residual=_rms(residual) / scale,
+        max_residual=float(np.max(np.abs(residual))) if np.asarray(residual).size else 0.0,
+    )
 
 
 def _augmented_arc_matrix(

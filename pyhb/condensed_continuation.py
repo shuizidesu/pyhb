@@ -40,6 +40,7 @@ class CondensedContinuationConfig:
     omega_scale: float = 1.0
     max_steps: int = 500
     shrink_limit: int = 20
+    residual_floor: float = 1e-16
     s3_method: str = "fast"
     s3_quadrature_samples: int | None = None
     progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
@@ -54,6 +55,7 @@ class CondensedContinuationLog:
     omega: float
     arc_length: float
     converged: bool
+    relative_residual: float = np.inf
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,12 @@ class _ContinuationLinearState:
     linear_coupling_solution: NDArray[np.float64]
 
 
+@dataclass(frozen=True)
+class _ResidualStats:
+    relative_residual: float
+    max_residual: float
+
+
 class CondensedContinuationSolver:
     """Arc-length continuation solver condensed onto nonlinear DOFs."""
 
@@ -120,6 +128,7 @@ class CondensedContinuationSolver:
         self.config = config or CondensedContinuationConfig()
         _validate_positive_scale("q_scale", self.config.q_scale)
         _validate_positive_scale("omega_scale", self.config.omega_scale)
+        _validate_positive_scale("residual_floor", self.config.residual_floor)
         self.prepared = _prepare_condensed_problem(
             self.model,
             harmonics=self.config.harmonics,
@@ -254,8 +263,19 @@ class CondensedContinuationSolver:
         nonlinear_vector: NDArray[np.float64],
         parameter: float,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], _ContinuationLinearState]:
+        residual, jacobian, parameter_column, linear_state, _ = self._residual_jacobian_parameter_with_stats(
+            nonlinear_vector,
+            parameter,
+        )
+        return residual, jacobian, parameter_column, linear_state
+
+    def _residual_jacobian_parameter_with_stats(
+        self,
+        nonlinear_vector: NDArray[np.float64],
+        parameter: float,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], _ContinuationLinearState, _ResidualStats]:
         linear_state = self._build_linear_state(parameter)
-        return self._residual_jacobian_with_linear_state(nonlinear_vector, parameter, linear_state)
+        return self._residual_jacobian_with_linear_state_and_stats(nonlinear_vector, parameter, linear_state)
 
     def _residual_jacobian_with_linear_state(
         self,
@@ -263,6 +283,19 @@ class CondensedContinuationSolver:
         parameter: float,
         linear_state: _ContinuationLinearState,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], _ContinuationLinearState]:
+        residual, jacobian, parameter_column, linear_state, _ = self._residual_jacobian_with_linear_state_and_stats(
+            nonlinear_vector,
+            parameter,
+            linear_state,
+        )
+        return residual, jacobian, parameter_column, linear_state
+
+    def _residual_jacobian_with_linear_state_and_stats(
+        self,
+        nonlinear_vector: NDArray[np.float64],
+        parameter: float,
+        linear_state: _ContinuationLinearState,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], _ContinuationLinearState, _ResidualStats]:
         local_x, local_dx, local_ddx = _evaluate_coordinate_states(nonlinear_vector, self.prepared)
         force, terms = self._local_nonlinear_values(local_x, local_dx, local_ddx, parameter)
         nonlinear_force = _scatter_local_coefficients(
@@ -271,14 +304,20 @@ class CondensedContinuationSolver:
             nonlinear_vector.size,
         )
         nonlinear_parameter = self._local_nonlinear_parameter_coefficients(local_x, local_dx, local_ddx, parameter)
-        residual = linear_state.condensed_force - nonlinear_force - linear_state.condensed_linear @ nonlinear_vector
+        linear_product = linear_state.condensed_linear @ nonlinear_vector
+        residual = linear_state.condensed_force - nonlinear_force - linear_product
         jacobian = linear_state.condensed_linear + _local_nonlinear_jacobian(terms, self.prepared)
         parameter_column = (
             linear_state.condensed_force_derivative
             - nonlinear_parameter
             - linear_state.condensed_linear_derivative @ nonlinear_vector
         )
-        return residual, jacobian, parameter_column.reshape(-1, 1), linear_state
+        stats = _residual_stats(
+            residual,
+            (linear_state.condensed_force, nonlinear_force, linear_product),
+            self.config.residual_floor,
+        )
+        return residual, jacobian, parameter_column.reshape(-1, 1), linear_state, stats
 
     def _solve_initial(
         self,
@@ -287,18 +326,19 @@ class CondensedContinuationSolver:
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], _ContinuationLinearState, CondensedContinuationLog]:
         linear_state = self._build_linear_state(parameter)
         residual = np.full_like(nonlinear_vector, np.inf)
+        residual_stats = _ResidualStats(np.inf, np.inf)
         delta = np.full_like(nonlinear_vector, np.inf)
         for epoch in range(1, self.config.max_epoch + 1):
-            residual, jacobian, _, linear_state = self._residual_jacobian_with_linear_state(
+            residual, jacobian, _, linear_state, residual_stats = self._residual_jacobian_with_linear_state_and_stats(
                 nonlinear_vector,
                 parameter,
                 linear_state,
             )
             delta = np.linalg.solve(jacobian, residual)
             nonlinear_vector = nonlinear_vector + delta
-            if np.max(np.abs(residual)) <= self.config.res_tolerance or np.max(np.abs(delta)) <= self.config.delta_tolerance:
+            if residual_stats.relative_residual <= self.config.res_tolerance or np.max(np.abs(delta)) <= self.config.delta_tolerance:
                 break
-        residual, jacobian, _, linear_state = self._residual_jacobian_with_linear_state(
+        residual, jacobian, _, linear_state, residual_stats = self._residual_jacobian_with_linear_state_and_stats(
             nonlinear_vector,
             parameter,
             linear_state,
@@ -306,12 +346,13 @@ class CondensedContinuationSolver:
         log = CondensedContinuationLog(
             step=0,
             epoch=epoch,
-            max_residual=float(np.max(np.abs(residual))),
+            relative_residual=residual_stats.relative_residual,
+            max_residual=residual_stats.max_residual,
             max_delta=float(np.max(np.abs(delta))),
             omega=float(parameter),
             arc_length=0.0,
             converged=bool(
-                np.max(np.abs(residual)) <= self.config.res_tolerance
+                residual_stats.relative_residual <= self.config.res_tolerance
                 or np.max(np.abs(delta)) <= self.config.delta_tolerance
             ),
         )
@@ -364,7 +405,8 @@ class CondensedContinuationSolver:
             )
         self._emit_progress(
             "Initial condensed computation, "
-            f"Epoch = {initial_log.epoch}, Res = {initial_log.max_residual:.6e}, "
+            f"Epoch = {initial_log.epoch}, RelRes = {initial_log.relative_residual:.6e}, "
+            f"MaxRes = {initial_log.max_residual:.6e}, "
             f"Delta = {initial_log.max_delta:.6e}, Omega = {initial_log.omega:.10g}"
         )
         _, _, parameter_column, linear_state = self._residual_jacobian_with_linear_state(
@@ -388,11 +430,12 @@ class CondensedContinuationSolver:
             nonlinear_vector = y[:-1].copy()
             parameter = float(y[-1])
             residual = np.full_like(nonlinear_vector, np.inf)
+            residual_stats = _ResidualStats(np.inf, np.inf)
             delta = np.full(nonlinear_vector.size + 1, np.inf, dtype=np.float64)
             j_arc_v = None
 
             for epoch in range(1, self.config.max_epoch + 1):
-                residual, jacobian, parameter_column, linear_state = self._residual_jacobian_parameter(
+                residual, jacobian, parameter_column, linear_state, residual_stats = self._residual_jacobian_parameter_with_stats(
                     nonlinear_vector,
                     parameter,
                 )
@@ -406,16 +449,16 @@ class CondensedContinuationSolver:
                 y = y - delta
                 nonlinear_vector = y[:-1].copy()
                 parameter = float(y[-1])
-                if np.max(np.abs(residual)) <= self.config.res_tolerance or np.max(np.abs(delta)) <= self.config.delta_tolerance:
+                if residual_stats.relative_residual <= self.config.res_tolerance or np.max(np.abs(delta)) <= self.config.delta_tolerance:
                     break
 
-            max_residual = float(np.max(np.abs(residual)))
             max_delta = float(np.max(np.abs(delta)))
-            converged = max_residual <= self.config.res_tolerance or max_delta <= self.config.delta_tolerance
+            converged = residual_stats.relative_residual <= self.config.res_tolerance or max_delta <= self.config.delta_tolerance
             step_log = CondensedContinuationLog(
                 step=step,
                 epoch=epoch,
-                max_residual=max_residual,
+                relative_residual=residual_stats.relative_residual,
+                max_residual=residual_stats.max_residual,
                 max_delta=max_delta,
                 omega=float(parameter),
                 arc_length=float(arc_length_step),
@@ -424,7 +467,8 @@ class CondensedContinuationSolver:
             logs.append(step_log)
             status = "ok" if step_log.converged else "no convergence"
             self._emit_progress(
-                f"Times = {step_log.step}, Epoch = {step_log.epoch}, Res = {step_log.max_residual:.6e}, "
+                f"Times = {step_log.step}, Epoch = {step_log.epoch}, RelRes = {step_log.relative_residual:.6e}, "
+                f"MaxRes = {step_log.max_residual:.6e}, "
                 f"Delta = {step_log.max_delta:.6e}, Omega = {step_log.omega:.10g}, "
                 f"s = {step_log.arc_length:.6g}, {status}"
             )
@@ -773,6 +817,26 @@ def _parameter_derivative_scale(parameter: float, power: float) -> float:
     if power == 0.0:
         return 0.0
     return power * parameter ** (power - 1.0)
+
+
+def _rms(values: NDArray[np.float64]) -> float:
+    vector = np.asarray(values, dtype=np.float64).reshape(-1)
+    if vector.size == 0:
+        return 0.0
+    return float(np.linalg.norm(vector) / np.sqrt(vector.size))
+
+
+def _residual_stats(
+    residual: NDArray[np.float64],
+    scale_terms: tuple[NDArray[np.float64], ...],
+    residual_floor: float,
+) -> _ResidualStats:
+    scale = max((_rms(term) for term in scale_terms), default=0.0)
+    scale = max(scale, float(residual_floor))
+    return _ResidualStats(
+        relative_residual=_rms(residual) / scale,
+        max_residual=float(np.max(np.abs(residual))) if np.asarray(residual).size else 0.0,
+    )
 
 
 def _coefficient_indices(dofs: Sequence[int], order: int) -> NDArray[np.int64]:
