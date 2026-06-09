@@ -32,8 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stability", action="store_true")
     parser.add_argument("--stability-output", type=Path, default=None)
     parser.add_argument("--hsu-samples", type=int, default=512)
-    parser.add_argument("--floquet-method", choices=("hsu", "auto", "explicit", "dominant"), default="hsu")
-    parser.add_argument("--n-multipliers", type=int, default=8)
+    parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="trapezoid")
     parser.add_argument("--torch-device", type=str, default=None)
     return parser.parse_args()
 
@@ -79,25 +78,21 @@ def compute_stability_history(
     coefficient_history: NDArray[np.float64],
     hsu_samples: int,
     floquet_method: str,
-    n_multipliers: int,
     torch_device: str | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     model = AeroEngineAutodiffRotorModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
         method=floquet_method,
-        n_multipliers=n_multipliers,
-        progress_callback=print,
     )
     spectral_radius = []
     stable = []
     total = int(parameter_history.size)
-    print(f"Computing Floquet stability... points={total}")
+    print(f"Computing Floquet stability... points={total}, method={floquet_method}, samples={hsu_samples}")
     for index, (parameter, coefficients) in enumerate(
         zip(parameter_history, coefficient_history, strict=True),
         start=1,
     ):
-        print(f"Floquet {index}/{total}, omega={float(parameter):.10g}")
         result = compute_floquet_autodiff(
             model,
             coefficients,
@@ -108,7 +103,7 @@ def compute_stability_history(
             torch_device=torch_device,
         )
         status = "stable" if result.stable else "unstable"
-        print(f"Floquet {index}/{total} done, rho={result.spectral_radius:.6e}, {status}")
+        print(f"Floquet {index}/{total} done, omega={float(parameter):.10g}, rho={result.spectral_radius:.6e}, {status}")
         spectral_radius.append(result.spectral_radius)
         stable.append(result.stable)
     return np.asarray(spectral_radius, dtype=np.float64), np.asarray(stable, dtype=np.bool_)
@@ -157,8 +152,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             parameter_history,
             coefficient_history,
             getattr(args, "hsu_samples", 512),
-            getattr(args, "floquet_method", "auto"),
-            getattr(args, "n_multipliers", 8),
+            getattr(args, "floquet_method", "trapezoid"),
             getattr(args, "torch_device", None),
         )
     save_plot(parameter_history, rms_history, dofs, args.output, stable_history)

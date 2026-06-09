@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 from scipy import linalg, sparse
-from scipy.sparse.linalg import LinearOperator, eigs, expm_multiply, splu
+from scipy.sparse.linalg import splu
 
 from .harmonics import generate_hb_items
 from .models import JacobianVariable, SecondOrderTimeModel
@@ -19,12 +19,8 @@ class FloquetConfig:
     """Options for Hsu-style Floquet multiplier computation."""
 
     hsu_samples: int = 512
-    method: str = "hsu"
-    explicit_state_limit: int = 800
-    hsu_dense_state_limit: int = 1200
-    n_multipliers: int = 8
+    method: str = "trapezoid"
     stability_tolerance: float = 1e-6
-    eigs_tolerance: float = 1e-8
     progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
 
@@ -128,31 +124,18 @@ def compute_floquet_from_sampled_jacobians(
     """Compute multipliers from precomputed time-domain nonlinear Jacobians."""
 
     _validate_config(config)
-    state_dim = 2 * model.n_dof
-    method = _resolve_method(config.method, state_dim, config.explicit_state_limit)
-    _emit_progress(
-        config,
-        "Floquet point, "
-        f"omega={samples.parameter:.10g}, method={method}, period={samples.period:.10g}, "
-        f"hsu_samples={config.hsu_samples}, state_dim={state_dim}",
-    )
-    if method == "hsu":
-        multipliers = _hsu_multipliers(samples, jacobians, config)
-    elif method == "explicit":
-        multipliers = _explicit_multipliers(samples, jacobians)
-    else:
-        multipliers = _dominant_multipliers(samples, jacobians, config)
+    method = _resolve_method(config.method)
+    if method == "trapezoid":
+        multipliers = _trapezoid_multipliers(samples, jacobians)
+    elif method == "exponential":
+        multipliers = _exponential_multipliers(samples, jacobians)
+    else:  # pragma: no cover - _resolve_method keeps this unreachable.
+        raise ValueError(f"unsupported Floquet method {method!r}")
     spectral_radius = float(np.max(np.abs(multipliers))) if multipliers.size else 0.0
     stable = bool(spectral_radius <= 1.0 + float(config.stability_tolerance))
-    if method == "explicit":
-        _emit_progress(
-            config,
-            "Floquet explicit finished, "
-            f"omega={samples.parameter:.10g}, rho={spectral_radius:.6e}, {_stability_label(stable)}",
-        )
     _emit_progress(
         config,
-        "Floquet finished, "
+        "Floquet done, "
         f"omega={samples.parameter:.10g}, rho={spectral_radius:.6e}, {_stability_label(stable)}",
     )
     return FloquetResult(
@@ -284,7 +267,7 @@ def sampled_jacobians_from_local_arrays(
     return result
 
 
-def _explicit_multipliers(
+def _exponential_multipliers(
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
 ) -> NDArray[np.complex128]:
@@ -296,26 +279,12 @@ def _explicit_multipliers(
     return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
 
 
-def _hsu_multipliers(
+def _trapezoid_multipliers(
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
-    config: FloquetConfig,
 ) -> NDArray[np.complex128]:
-    state_dim = 2 * samples.mass.shape[0]
     steps = _hsu_steps(samples, jacobians)
-    if state_dim <= int(config.hsu_dense_state_limit) or int(config.n_multipliers) >= state_dim - 1:
-        _emit_progress(
-            config,
-            "Floquet Hsu dense multipliers, "
-            f"omega={samples.parameter:.10g}, state_dim={state_dim}",
-        )
-        return _hsu_dense_multipliers(steps, samples.mass.shape[0])
-    _emit_progress(
-        config,
-        "Floquet Hsu dominant multipliers, "
-        f"omega={samples.parameter:.10g}, k={config.n_multipliers}, eigs_tol={config.eigs_tolerance:.3e}",
-    )
-    return _hsu_dominant_multipliers(steps, samples.mass.shape[0], config)
+    return _hsu_dense_multipliers(steps, samples.mass.shape[0])
 
 
 def _hsu_steps(
@@ -361,73 +330,6 @@ def _hsu_dense_multipliers(
     return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
 
 
-def _hsu_dominant_multipliers(
-    steps: tuple[_HsuStep, ...],
-    n_dof: int,
-    config: FloquetConfig,
-) -> NDArray[np.complex128]:
-    state_dim = 2 * n_dof
-
-    def matvec(vector: NDArray[np.float64]) -> NDArray[np.float64]:
-        propagated = np.asarray(vector, dtype=np.float64)
-        for step in steps:
-            propagated = step.left_lu.solve(step.right @ propagated)
-        return np.asarray(propagated, dtype=np.float64)
-
-    monodromy = LinearOperator(
-        (state_dim, state_dim),
-        matvec=matvec,
-        dtype=np.float64,
-    )
-    k = min(int(config.n_multipliers), max(1, state_dim - 2))
-    ncv = min(state_dim - 1, max(2 * k + 1, 4 * k + 20))
-    initial_vector = np.ones(state_dim, dtype=np.float64)
-    values = eigs(
-        monodromy,
-        k=k,
-        which="LM",
-        tol=float(config.eigs_tolerance),
-        ncv=ncv,
-        v0=initial_vector,
-        return_eigenvectors=False,
-    )
-    return np.asarray(values, dtype=np.complex128)
-
-
-def _dominant_multipliers(
-    samples: _SolutionSamples,
-    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
-    config: FloquetConfig,
-) -> NDArray[np.complex128]:
-    state_dim = 2 * samples.mass.shape[0]
-    operators = tuple(
-        _state_linear_operator(samples, jacobians, sample_index)
-        for sample_index in range(samples.t.size)
-    )
-
-    def matvec(vector: NDArray[np.float64]) -> NDArray[np.float64]:
-        propagated = np.asarray(vector, dtype=np.float64)
-        for operator in operators:
-            propagated = expm_multiply(_scaled_operator(operator, samples.dt), propagated, traceA=0.0)
-        return np.asarray(propagated, dtype=np.float64)
-
-    monodromy = LinearOperator(
-        (state_dim, state_dim),
-        matvec=matvec,
-        dtype=np.float64,
-    )
-    k = min(int(config.n_multipliers), max(1, state_dim - 2))
-    if k >= state_dim - 1:
-        return _explicit_multipliers(samples, jacobians)
-    _emit_progress(
-        config,
-        "Floquet dominant multipliers, "
-        f"omega={samples.parameter:.10g}, k={k}, eigs_tol={config.eigs_tolerance:.3e}",
-    )
-    values = eigs(monodromy, k=k, which="LM", tol=float(config.eigs_tolerance), return_eigenvectors=False)
-    return np.asarray(values, dtype=np.complex128)
-
-
 def _dense_state_matrix(
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
@@ -445,55 +347,9 @@ def _dense_state_matrix(
     return state_matrix
 
 
-def _state_linear_operator(
-    samples: _SolutionSamples,
-    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
-    sample_index: int,
-) -> LinearOperator:
-    n_dof = samples.mass.shape[0]
-    mass = _as_sparse(samples.mass) + jacobians["ddx"][sample_index]
-    damping = _as_sparse(samples.damping) + jacobians["dx"][sample_index]
-    stiffness = _as_sparse(samples.stiffness) + jacobians["x"][sample_index]
-    mass_lu = splu(mass.tocsc())
-
-    def matvec(vector: NDArray[np.float64]) -> NDArray[np.float64]:
-        displacement = vector[:n_dof]
-        velocity = vector[n_dof:]
-        acceleration = mass_lu.solve(-(stiffness @ displacement + damping @ velocity))
-        return np.concatenate((velocity, acceleration))
-
-    def rmatvec(vector: NDArray[np.float64]) -> NDArray[np.float64]:
-        head = vector[:n_dof]
-        tail = vector[n_dof:]
-        solved_tail = mass_lu.solve(tail, trans="T")
-        return np.concatenate((-(stiffness.T @ solved_tail), head - damping.T @ solved_tail))
-
-    return LinearOperator(
-        (2 * n_dof, 2 * n_dof),
-        matvec=matvec,
-        rmatvec=rmatvec,
-        dtype=np.float64,
-    )
-
-
-def _scaled_operator(operator: LinearOperator, scale: float) -> LinearOperator:
-    return LinearOperator(
-        operator.shape,
-        matvec=lambda vector: scale * operator.matvec(vector),
-        rmatvec=lambda vector: scale * operator.rmatvec(vector),
-        dtype=np.float64,
-    )
-
-
-def _as_sparse(matrix: NDArray[np.float64] | sparse.spmatrix) -> sparse.csc_matrix:
-    return matrix.tocsc() if sparse.issparse(matrix) else sparse.csc_matrix(np.asarray(matrix, dtype=np.float64))
-
-
-def _resolve_method(method: str, state_dim: int, explicit_state_limit: int) -> str:
-    if method == "auto":
-        return "explicit" if state_dim <= int(explicit_state_limit) else "dominant"
-    if method not in {"hsu", "explicit", "dominant"}:
-        raise ValueError("FloquetConfig.method must be 'hsu', 'auto', 'explicit', or 'dominant'")
+def _resolve_method(method: str) -> str:
+    if method not in {"trapezoid", "exponential"}:
+        raise ValueError("FloquetConfig.method must be 'trapezoid' or 'exponential'")
     return method
 
 
@@ -529,13 +385,5 @@ def _stability_label(stable: bool) -> str:
 def _validate_config(config: FloquetConfig) -> None:
     if config.hsu_samples <= 0:
         raise ValueError("hsu_samples must be positive")
-    if config.explicit_state_limit <= 0:
-        raise ValueError("explicit_state_limit must be positive")
-    if config.hsu_dense_state_limit <= 0:
-        raise ValueError("hsu_dense_state_limit must be positive")
-    if config.n_multipliers <= 0:
-        raise ValueError("n_multipliers must be positive")
     if config.stability_tolerance < 0.0:
         raise ValueError("stability_tolerance must be non-negative")
-    if config.eigs_tolerance <= 0.0:
-        raise ValueError("eigs_tolerance must be positive")

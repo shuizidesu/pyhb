@@ -43,7 +43,7 @@ FRACTIONAL_HARMONICS = (
     6.0,
 )
 BOOTSTRAP_HARMONICS = FRACTIONAL_HARMONICS[:15]
-DEFAULT_PLOT_DOFS = (0, 1, 2, 3)
+DEFAULT_PLOT_DOFS = (0, 2)
 Q_SCALE = 2.0
 OMEGA_SCALE = 300.0
 INITIAL_SCALE = 1e-2
@@ -64,6 +64,9 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
         max_steps=args.max_steps,
         frequency_resolution=FREQUENCY_RESOLUTION,
         harmonics=FRACTIONAL_HARMONICS,
+        s_initial=0.05,
+        s_max=0.1,
+        s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
         progress_callback=print,
