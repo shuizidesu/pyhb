@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stability", action="store_true")
     parser.add_argument("--stability-output", type=Path, default=None)
     parser.add_argument("--hsu-samples", type=int, default=512)
-    parser.add_argument("--floquet-method", choices=("auto", "explicit", "dominant"), default="auto")
+    parser.add_argument("--floquet-method", choices=("hsu", "auto", "explicit", "dominant"), default="hsu")
     parser.add_argument("--n-multipliers", type=int, default=8)
     return parser.parse_args()
 

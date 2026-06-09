@@ -11,7 +11,7 @@ from scipy import linalg, sparse
 from scipy.sparse.linalg import LinearOperator, eigs, expm_multiply, splu
 
 from .harmonics import generate_hb_items
-from .models import JacobianVariable, SecondOrderTimeModel, _combine_time_operator_matrices
+from .models import JacobianVariable, SecondOrderTimeModel
 
 
 @dataclass(frozen=True)
@@ -19,8 +19,9 @@ class FloquetConfig:
     """Options for Hsu-style Floquet multiplier computation."""
 
     hsu_samples: int = 512
-    method: str = "auto"
+    method: str = "hsu"
     explicit_state_limit: int = 800
+    hsu_dense_state_limit: int = 1200
     n_multipliers: int = 8
     stability_tolerance: float = 1e-6
     eigs_tolerance: float = 1e-8
@@ -87,9 +88,15 @@ class _SolutionSamples:
     x: NDArray[np.float64]
     dx: NDArray[np.float64]
     ddx: NDArray[np.float64]
-    mass: NDArray[np.float64]
-    damping: NDArray[np.float64]
-    stiffness: NDArray[np.float64]
+    mass: sparse.csc_matrix
+    damping: sparse.csc_matrix
+    stiffness: sparse.csc_matrix
+
+
+@dataclass(frozen=True)
+class _HsuStep:
+    left_lu: object
+    right: sparse.csc_matrix
 
 
 def prepare_solution_samples(
@@ -129,7 +136,9 @@ def compute_floquet_from_sampled_jacobians(
         f"omega={samples.parameter:.10g}, method={method}, period={samples.period:.10g}, "
         f"hsu_samples={config.hsu_samples}, state_dim={state_dim}",
     )
-    if method == "explicit":
+    if method == "hsu":
+        multipliers = _hsu_multipliers(samples, jacobians, config)
+    elif method == "explicit":
         multipliers = _explicit_multipliers(samples, jacobians)
     else:
         multipliers = _dominant_multipliers(samples, jacobians, config)
@@ -177,7 +186,7 @@ def _prepare_solution_samples(
     x = hb_item @ coefficient_matrix
     dx = hb_item_dt @ coefficient_matrix
     ddx = hb_item_ddt @ coefficient_matrix
-    mass, damping, stiffness = _combine_time_operator_matrices(
+    mass, damping, stiffness = _combine_sparse_time_operator_matrices(
         model.linear_operator_terms(),
         float(parameter),
         model.n_dof,
@@ -287,6 +296,104 @@ def _explicit_multipliers(
     return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
 
 
+def _hsu_multipliers(
+    samples: _SolutionSamples,
+    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
+    config: FloquetConfig,
+) -> NDArray[np.complex128]:
+    state_dim = 2 * samples.mass.shape[0]
+    steps = _hsu_steps(samples, jacobians)
+    if state_dim <= int(config.hsu_dense_state_limit) or int(config.n_multipliers) >= state_dim - 1:
+        _emit_progress(
+            config,
+            "Floquet Hsu dense multipliers, "
+            f"omega={samples.parameter:.10g}, state_dim={state_dim}",
+        )
+        return _hsu_dense_multipliers(steps, samples.mass.shape[0])
+    _emit_progress(
+        config,
+        "Floquet Hsu dominant multipliers, "
+        f"omega={samples.parameter:.10g}, k={config.n_multipliers}, eigs_tol={config.eigs_tolerance:.3e}",
+    )
+    return _hsu_dominant_multipliers(steps, samples.mass.shape[0], config)
+
+
+def _hsu_steps(
+    samples: _SolutionSamples,
+    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
+) -> tuple[_HsuStep, ...]:
+    mass_base = samples.mass
+    damping_base = samples.damping
+    stiffness_base = samples.stiffness
+    dt = float(samples.dt)
+    identity = sparse.identity(samples.mass.shape[0], format="csc", dtype=np.float64)
+    steps = []
+    for sample_index in range(samples.t.size):
+        mass = mass_base + jacobians["ddx"][sample_index]
+        damping = damping_base + jacobians["dx"][sample_index]
+        stiffness = stiffness_base + jacobians["x"][sample_index]
+        left = sparse.bmat(
+            (
+                (identity, -0.5 * dt * identity),
+                (0.5 * dt * stiffness, mass + 0.5 * dt * damping),
+            ),
+            format="csc",
+        )
+        right = sparse.bmat(
+            (
+                (identity, 0.5 * dt * identity),
+                (-0.5 * dt * stiffness, mass - 0.5 * dt * damping),
+            ),
+            format="csc",
+        )
+        steps.append(_HsuStep(splu(left), right))
+    return tuple(steps)
+
+
+def _hsu_dense_multipliers(
+    steps: tuple[_HsuStep, ...],
+    n_dof: int,
+) -> NDArray[np.complex128]:
+    state_dim = 2 * n_dof
+    monodromy = np.eye(state_dim, dtype=np.float64)
+    for step in steps:
+        monodromy = step.left_lu.solve(step.right @ monodromy)
+    return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
+
+
+def _hsu_dominant_multipliers(
+    steps: tuple[_HsuStep, ...],
+    n_dof: int,
+    config: FloquetConfig,
+) -> NDArray[np.complex128]:
+    state_dim = 2 * n_dof
+
+    def matvec(vector: NDArray[np.float64]) -> NDArray[np.float64]:
+        propagated = np.asarray(vector, dtype=np.float64)
+        for step in steps:
+            propagated = step.left_lu.solve(step.right @ propagated)
+        return np.asarray(propagated, dtype=np.float64)
+
+    monodromy = LinearOperator(
+        (state_dim, state_dim),
+        matvec=matvec,
+        dtype=np.float64,
+    )
+    k = min(int(config.n_multipliers), max(1, state_dim - 2))
+    ncv = min(state_dim - 1, max(2 * k + 1, 4 * k + 20))
+    initial_vector = np.ones(state_dim, dtype=np.float64)
+    values = eigs(
+        monodromy,
+        k=k,
+        which="LM",
+        tol=float(config.eigs_tolerance),
+        ncv=ncv,
+        v0=initial_vector,
+        return_eigenvectors=False,
+    )
+    return np.asarray(values, dtype=np.complex128)
+
+
 def _dominant_multipliers(
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
@@ -327,9 +434,9 @@ def _dense_state_matrix(
     sample_index: int,
 ) -> NDArray[np.float64]:
     n_dof = samples.mass.shape[0]
-    mass = samples.mass + jacobians["ddx"][sample_index].toarray()
-    damping = samples.damping + jacobians["dx"][sample_index].toarray()
-    stiffness = samples.stiffness + jacobians["x"][sample_index].toarray()
+    mass = (samples.mass + jacobians["ddx"][sample_index]).toarray()
+    damping = (samples.damping + jacobians["dx"][sample_index]).toarray()
+    stiffness = (samples.stiffness + jacobians["x"][sample_index]).toarray()
     solved = linalg.solve(mass, np.column_stack((stiffness, damping)), assume_a="gen")
     state_matrix = np.zeros((2 * n_dof, 2 * n_dof), dtype=np.float64)
     state_matrix[:n_dof, n_dof:] = np.eye(n_dof, dtype=np.float64)
@@ -385,9 +492,29 @@ def _as_sparse(matrix: NDArray[np.float64] | sparse.spmatrix) -> sparse.csc_matr
 def _resolve_method(method: str, state_dim: int, explicit_state_limit: int) -> str:
     if method == "auto":
         return "explicit" if state_dim <= int(explicit_state_limit) else "dominant"
-    if method not in {"explicit", "dominant"}:
-        raise ValueError("FloquetConfig.method must be 'auto', 'explicit', or 'dominant'")
+    if method not in {"hsu", "explicit", "dominant"}:
+        raise ValueError("FloquetConfig.method must be 'hsu', 'auto', 'explicit', or 'dominant'")
     return method
+
+
+def _combine_sparse_time_operator_matrices(
+    terms: Sequence[object],
+    parameter: float,
+    n_dof: int,
+) -> tuple[sparse.csc_matrix, sparse.csc_matrix, sparse.csc_matrix]:
+    matrices = {
+        "ddx": sparse.csc_matrix((n_dof, n_dof), dtype=np.float64),
+        "dx": sparse.csc_matrix((n_dof, n_dof), dtype=np.float64),
+        "x": sparse.csc_matrix((n_dof, n_dof), dtype=np.float64),
+    }
+    for term in terms:
+        if term.basis_type not in matrices:
+            raise ValueError(f"unsupported linear operator basis_type: {term.basis_type!r}")
+        matrix = sparse.csc_matrix(term.matrix, dtype=np.float64)
+        if matrix.shape != (n_dof, n_dof):
+            raise ValueError(f"linear operator matrix must have shape {(n_dof, n_dof)}, got {matrix.shape}")
+        matrices[term.basis_type] = matrices[term.basis_type] + float(parameter) ** float(term.parameter_power) * matrix
+    return matrices["ddx"].tocsc(), matrices["dx"].tocsc(), matrices["x"].tocsc()
 
 
 def _emit_progress(config: FloquetConfig, message: str) -> None:
@@ -404,6 +531,8 @@ def _validate_config(config: FloquetConfig) -> None:
         raise ValueError("hsu_samples must be positive")
     if config.explicit_state_limit <= 0:
         raise ValueError("explicit_state_limit must be positive")
+    if config.hsu_dense_state_limit <= 0:
+        raise ValueError("hsu_dense_state_limit must be positive")
     if config.n_multipliers <= 0:
         raise ValueError("n_multipliers must be positive")
     if config.stability_tolerance < 0.0:
