@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stability-output", type=Path, default=None)
     parser.add_argument("--hsu-samples", type=int, default=512)
     parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="trapezoid")
+    parser.add_argument("--stability-tolerance", type=float, default=1e-4)
     return parser.parse_args()
 
 
@@ -77,11 +78,13 @@ def compute_stability_history(
     coefficient_history: NDArray[np.float64],
     hsu_samples: int,
     floquet_method: str,
+    stability_tolerance: float,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     model = AeroEngineRotorModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
         method=floquet_method,
+        stability_tolerance=stability_tolerance,
     )
     spectral_radius = []
     stable = []
@@ -143,6 +146,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             coefficient_history,
             getattr(args, "hsu_samples", 512),
             getattr(args, "floquet_method", "trapezoid"),
+            getattr(args, "stability_tolerance", 1e-4),
         )
     save_plot(parameter_history, rms_history, dofs, args.output, stable_history)
     if args.rms_output is not None:
