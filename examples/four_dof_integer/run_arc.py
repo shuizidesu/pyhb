@@ -16,13 +16,14 @@ from examples.four_dof_integer.model import FourDofIntegerModel
 
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
-DEFAULT_MAX_STEPS = 3000
-DEFAULT_SAMPLE_FFT = 2**11
+DEFAULT_MAX_STEPS = 85
+DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 1.0
 HARMONICS = tuple(float(value) for value in range(1, 11))
 DEFAULT_PLOT_DOFS = (0, 1, 2, 3)
 INITIAL_SCALE = 1e-2
-
+Q_SCALE = 2.0
+OMEGA_SCALE = 300.0
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the 4DOF integer-harmonic arc-length example.")
@@ -38,7 +39,9 @@ def build_config(args: argparse.Namespace) -> ContinuationConfig:
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
         max_steps=args.max_steps,
-        progress_callback=print,
+        q_scale=Q_SCALE,
+        omega_scale=OMEGA_SCALE,
+        progress_callback=print
     )
 
 

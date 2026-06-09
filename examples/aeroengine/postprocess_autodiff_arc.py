@@ -19,7 +19,7 @@ from examples.aeroengine.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RE
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
-DEFAULT_SAMPLE_COUNT = 4096
+DEFAULT_SAMPLE_COUNT = 512
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,10 +87,17 @@ def compute_stability_history(
         hsu_samples=hsu_samples,
         method=floquet_method,
         n_multipliers=n_multipliers,
+        progress_callback=print,
     )
     spectral_radius = []
     stable = []
-    for parameter, coefficients in zip(parameter_history, coefficient_history, strict=True):
+    total = int(parameter_history.size)
+    print(f"Computing Floquet stability... points={total}")
+    for index, (parameter, coefficients) in enumerate(
+        zip(parameter_history, coefficient_history, strict=True),
+        start=1,
+    ):
+        print(f"Floquet {index}/{total}, omega={float(parameter):.10g}")
         result = compute_floquet_autodiff(
             model,
             coefficients,
@@ -100,6 +107,8 @@ def compute_stability_history(
             config,
             torch_device=torch_device,
         )
+        status = "stable" if result.stable else "unstable"
+        print(f"Floquet {index}/{total} done, rho={result.spectral_radius:.6e}, {status}")
         spectral_radius.append(result.spectral_radius)
         stable.append(result.stable)
     return np.asarray(spectral_radius, dtype=np.float64), np.asarray(stable, dtype=np.bool_)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,6 +24,7 @@ class FloquetConfig:
     n_multipliers: int = 8
     stability_tolerance: float = 1e-6
     eigs_tolerance: float = 1e-8
+    progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -122,16 +123,34 @@ def compute_floquet_from_sampled_jacobians(
     _validate_config(config)
     state_dim = 2 * model.n_dof
     method = _resolve_method(config.method, state_dim, config.explicit_state_limit)
+    _emit_progress(
+        config,
+        "Floquet point, "
+        f"omega={samples.parameter:.10g}, method={method}, period={samples.period:.10g}, "
+        f"hsu_samples={config.hsu_samples}, state_dim={state_dim}",
+    )
     if method == "explicit":
         multipliers = _explicit_multipliers(samples, jacobians)
     else:
         multipliers = _dominant_multipliers(samples, jacobians, config)
     spectral_radius = float(np.max(np.abs(multipliers))) if multipliers.size else 0.0
+    stable = bool(spectral_radius <= 1.0 + float(config.stability_tolerance))
+    if method == "explicit":
+        _emit_progress(
+            config,
+            "Floquet explicit finished, "
+            f"omega={samples.parameter:.10g}, rho={spectral_radius:.6e}, {_stability_label(stable)}",
+        )
+    _emit_progress(
+        config,
+        "Floquet finished, "
+        f"omega={samples.parameter:.10g}, rho={spectral_radius:.6e}, {_stability_label(stable)}",
+    )
     return FloquetResult(
         parameter=float(samples.parameter),
         multipliers=np.asarray(multipliers, dtype=np.complex128),
         spectral_radius=spectral_radius,
-        stable=bool(spectral_radius <= 1.0 + float(config.stability_tolerance)),
+        stable=stable,
         method=method,
         period=float(samples.period),
         hsu_samples=int(config.hsu_samples),
@@ -293,6 +312,11 @@ def _dominant_multipliers(
     k = min(int(config.n_multipliers), max(1, state_dim - 2))
     if k >= state_dim - 1:
         return _explicit_multipliers(samples, jacobians)
+    _emit_progress(
+        config,
+        "Floquet dominant multipliers, "
+        f"omega={samples.parameter:.10g}, k={k}, eigs_tol={config.eigs_tolerance:.3e}",
+    )
     values = eigs(monodromy, k=k, which="LM", tol=float(config.eigs_tolerance), return_eigenvectors=False)
     return np.asarray(values, dtype=np.complex128)
 
@@ -364,6 +388,15 @@ def _resolve_method(method: str, state_dim: int, explicit_state_limit: int) -> s
     if method not in {"explicit", "dominant"}:
         raise ValueError("FloquetConfig.method must be 'auto', 'explicit', or 'dominant'")
     return method
+
+
+def _emit_progress(config: FloquetConfig, message: str) -> None:
+    if config.progress_callback is not None:
+        config.progress_callback(message)
+
+
+def _stability_label(stable: bool) -> str:
+    return "stable" if stable else "unstable"
 
 
 def _validate_config(config: FloquetConfig) -> None:

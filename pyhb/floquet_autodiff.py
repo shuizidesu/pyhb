@@ -13,6 +13,7 @@ from .continuation_autodiff import _resolve_torch_device, _to_numpy
 from .floquet import (
     FloquetConfig,
     FloquetResult,
+    _emit_progress,
     compute_floquet_from_sampled_jacobians,
     prepare_solution_samples,
     sampled_jacobians_from_local_arrays,
@@ -42,6 +43,7 @@ def compute_floquet_autodiff(
         frequency_resolution,
         active_config,
     )
+    _emit_progress(active_config, f"Floquet autodiff Jacobians, omega={float(parameter):.10g}, device={device}")
     jacobian_by_variable = _autodiff_jacobians(
         model,
         samples.t,
