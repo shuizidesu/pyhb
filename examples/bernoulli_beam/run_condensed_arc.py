@@ -16,13 +16,13 @@ from examples.bernoulli_beam.model import BernoulliBeamModel
 
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "condensed_arc.npz"
-DEFAULT_MAX_STEPS = 250
+DEFAULT_MAX_STEPS = 80
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 1.0
 INIT_OMEGA = 4.0
 MAX_EPOCH = 25
 INITIAL_SCALE = 1e-2
-RES_TOLERANCE = 1e-6
+RES_TOLERANCE = 5e-4
 DELTA_TOLERANCE = 1e-8
 Q_SCALE = 1.0
 OMEGA_SCALE = 5.0
