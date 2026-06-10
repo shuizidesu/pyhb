@@ -16,7 +16,7 @@ from examples.aeroengine.autodiff_model import AeroEngineAutodiffRotorModel
 
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
-DEFAULT_MAX_STEPS = 800
+DEFAULT_MAX_STEPS = 690
 DEFAULT_SAMPLE_FFT = 2 ** 11
 FREQUENCY_RESOLUTION = 0.1
 INIT_OMEGA = 145.0
@@ -26,6 +26,7 @@ RES_TOLERANCE = 1e-10
 DELTA_TOLERANCE = 1e-12
 Q_SCALE = 1e-4
 OMEGA_SCALE = 100.0
+MAX_PARAMETER_STEP = 0.7
 DEFAULT_PLOT_DOFS = (34, 176, 68, 210)
 
 
@@ -60,6 +61,7 @@ def build_config(args: argparse.Namespace) -> ContinuationAutodiffConfig:
         s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
+        max_parameter_step=MAX_PARAMETER_STEP,
         max_steps=args.max_steps,
         progress_callback=print,
         torch_device=args.torch_device,

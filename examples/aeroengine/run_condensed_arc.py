@@ -32,6 +32,7 @@ RES_TOLERANCE = 1e-10
 DELTA_TOLERANCE = 1e-12
 Q_SCALE = 1e-4
 OMEGA_SCALE = 200
+MAX_PARAMETER_STEP = 0.5
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +57,7 @@ def build_config(args: argparse.Namespace, init_omega: float = INIT_OMEGA) -> Co
         s_min=1e-9,
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
+        max_parameter_step=MAX_PARAMETER_STEP,
         max_steps=args.max_steps,
         progress_callback=print,
     )

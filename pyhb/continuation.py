@@ -33,6 +33,8 @@ class ContinuationConfig:
     s_min: float = 1e-6
     q_scale: float = 1.0
     omega_scale: float = 1.0
+    max_parameter_step: float | None = None
+    parameter_step_safety: float = 0.8
     max_steps: int = 500
     shrink_limit: int = 20
     residual_floor: float = 1e-16
@@ -91,6 +93,8 @@ class ContinuationSolver:
         self.config = config or ContinuationConfig()
         _validate_positive_scale("q_scale", self.config.q_scale)
         _validate_positive_scale("omega_scale", self.config.omega_scale)
+        _validate_optional_positive_scale("max_parameter_step", self.config.max_parameter_step)
+        _validate_positive_scale("parameter_step_safety", self.config.parameter_step_safety)
         _validate_positive_scale("residual_floor", self.config.residual_floor)
         self.prepared = self._prepare()
 
@@ -396,81 +400,107 @@ class ContinuationSolver:
         shrink_count = 0
 
         for step in range(1, config.max_steps + 1):
-            epoch = 1
-            y = y0 + arc_length_step * tangent
-            coeff_line = y[:-1].copy()
-            parameter = float(y[-1])
-            residual_vector = np.full(self.model.n_dof * order, np.inf, dtype=np.float64)
-            residual_stats = _ResidualStats(np.inf, np.inf)
-            delta = np.full(self.model.n_dof * order + 1, np.inf, dtype=np.float64)
-            j_arc_lu = None
-
-            while (
-                epoch < config.max_epoch
-                and residual_stats.relative_residual >= config.res_tolerance
-                and np.max(np.abs(delta)) >= config.delta_tolerance
-            ):
-                coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-                jacobian = self._jacobian(x, dx, ddx, parameter)
-                residual_terms = self._residual_terms(coeff_line, x, dx, ddx, parameter)
-                residual_vector = residual_terms[0]
-                residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-                j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
-                r_arc = np.concatenate(
-                    (
-                        residual_vector,
-                        np.array(
-                            [self._weighted_inner(y - y0, tangent) - arc_length_step],
-                            dtype=np.float64,
-                        ),
-                    )
-                )
-                j_arc_v = _augmented_arc_matrix(jacobian, j_parameter, self._weighted_constraint_row(tangent))
-                j_arc_lu = splu(j_arc_v)
-                delta = j_arc_lu.solve(r_arc)
-                y = y - delta
+            while True:
+                epoch = 1
+                y = y0 + arc_length_step * tangent
                 coeff_line = y[:-1].copy()
                 parameter = float(y[-1])
-                epoch += 1
+                residual_vector = np.full(self.model.n_dof * order, np.inf, dtype=np.float64)
+                residual_stats = _ResidualStats(np.inf, np.inf)
+                delta = np.full(self.model.n_dof * order + 1, np.inf, dtype=np.float64)
+                j_arc_lu = None
 
-            max_delta = float(np.max(np.abs(delta)))
-            converged = residual_stats.relative_residual <= config.res_tolerance or max_delta <= config.delta_tolerance
-            step_log = StepLog(
-                step=step,
-                epoch=epoch,
-                max_residual=residual_stats.max_residual,
-                max_delta=max_delta,
-                omega=float(parameter),
-                arc_length=float(arc_length_step),
-                converged=bool(converged),
-                relative_residual=residual_stats.relative_residual,
-            )
-            logs.append(step_log)
-            status = "ok" if step_log.converged else "no convergence"
-            self._emit_progress(
-                f"Times = {step_log.step}, Epoch = {step_log.epoch}, RelRes = {step_log.relative_residual:.6e}, "
-                f"MaxRes = {step_log.max_residual:.6e}, "
-                f"Delta = {step_log.max_delta:.6e}, Omega = {step_log.omega:.10g}, "
-                f"s = {step_log.arc_length:.6g}, {status}"
-            )
+                while (
+                    epoch < config.max_epoch
+                    and residual_stats.relative_residual >= config.res_tolerance
+                    and np.max(np.abs(delta)) >= config.delta_tolerance
+                ):
+                    coeff, x, dx, ddx = self._evaluate_state(coeff_line)
+                    jacobian = self._jacobian(x, dx, ddx, parameter)
+                    residual_terms = self._residual_terms(coeff_line, x, dx, ddx, parameter)
+                    residual_vector = residual_terms[0]
+                    residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
+                    j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
+                    r_arc = np.concatenate(
+                        (
+                            residual_vector,
+                            np.array(
+                                [self._weighted_inner(y - y0, tangent) - arc_length_step],
+                                dtype=np.float64,
+                            ),
+                        )
+                    )
+                    j_arc_v = _augmented_arc_matrix(jacobian, j_parameter, self._weighted_constraint_row(tangent))
+                    j_arc_lu = splu(j_arc_v)
+                    delta = j_arc_lu.solve(r_arc)
+                    y = y - delta
+                    coeff_line = y[:-1].copy()
+                    parameter = float(y[-1])
+                    epoch += 1
 
-            if converged:
-                y0 = y.copy()
-                if j_arc_lu is None:
-                    raise RuntimeError("converged before assembling arc Jacobian")
-                tangent_candidate = j_arc_lu.solve(np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0]))))
-                tangent = self._weighted_normalize(tangent_candidate)
-                coeff, _, _, _ = self._evaluate_state(coeff_line)
-                parameter_history.append(float(parameter))
-                coefficient_history.append(coeff.copy())
-                shrink_count = 0
-            else:
+                max_delta = float(np.max(np.abs(delta)))
+                converged = residual_stats.relative_residual <= config.res_tolerance or max_delta <= config.delta_tolerance
+                parameter_step = abs(float(parameter) - float(y0[-1]))
+                raw_parameter_step_too_large = _parameter_step_too_large(config.max_parameter_step, parameter_step)
+                parameter_step_too_large = bool(converged and raw_parameter_step_too_large)
+                accepted = bool(converged and not parameter_step_too_large)
+                step_log = StepLog(
+                    step=step,
+                    epoch=epoch,
+                    max_residual=residual_stats.max_residual,
+                    max_delta=max_delta,
+                    omega=float(parameter),
+                    arc_length=float(arc_length_step),
+                    converged=accepted,
+                    relative_residual=residual_stats.relative_residual,
+                )
+                logs.append(step_log)
+                if accepted:
+                    status = "ok"
+                elif not converged:
+                    status = "no convergence"
+                else:
+                    status = f"parameter step too large, dOmega = {parameter_step:.6g}"
+                self._emit_progress(
+                    f"Times = {step_log.step}, Epoch = {step_log.epoch}, RelRes = {step_log.relative_residual:.6e}, "
+                    f"MaxRes = {step_log.max_residual:.6e}, "
+                    f"Delta = {step_log.max_delta:.6e}, Omega = {step_log.omega:.10g}, "
+                    f"s = {step_log.arc_length:.6g}, {status}"
+                )
+
+                if accepted:
+                    y0 = y.copy()
+                    if j_arc_lu is None:
+                        raise RuntimeError("converged before assembling arc Jacobian")
+                    tangent_candidate = j_arc_lu.solve(
+                        np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0])))
+                    )
+                    tangent = self._weighted_normalize(tangent_candidate)
+                    coeff, _, _, _ = self._evaluate_state(coeff_line)
+                    parameter_history.append(float(parameter))
+                    coefficient_history.append(coeff.copy())
+                    shrink_count = 0
+                    arc_length_step = min(2.0 * arc_length_step, config.s_max)
+                    break
+
                 shrink_count += 1
+                if parameter_step_too_large:
+                    arc_length_step = _shrink_arc_length_for_parameter_step(
+                        arc_length_step,
+                        parameter_step,
+                        float(config.max_parameter_step),
+                        config.parameter_step_safety,
+                        config.s_min,
+                    )
+                    if shrink_count >= config.shrink_limit:
+                        break
+                    continue
 
-            if epoch >= config.max_epoch:
-                arc_length_step = max(0.5 * arc_length_step, config.s_min)
-            else:
-                arc_length_step = min(2.0 * arc_length_step, config.s_max)
+                if epoch >= config.max_epoch:
+                    arc_length_step = max(0.5 * arc_length_step, config.s_min)
+                else:
+                    arc_length_step = min(2.0 * arc_length_step, config.s_max)
+                break
 
             if shrink_count >= config.shrink_limit:
                 break
@@ -509,6 +539,26 @@ def _validate_positive_scale(name: str, value: float) -> None:
     scale = float(value)
     if not np.isfinite(scale) or scale <= 0.0:
         raise ValueError(f"{name} must be a positive finite value, got {value!r}")
+
+
+def _validate_optional_positive_scale(name: str, value: float | None) -> None:
+    if value is not None:
+        _validate_positive_scale(name, float(value))
+
+
+def _parameter_step_too_large(max_parameter_step: float | None, parameter_step: float) -> bool:
+    return max_parameter_step is not None and parameter_step > float(max_parameter_step)
+
+
+def _shrink_arc_length_for_parameter_step(
+    arc_length_step: float,
+    parameter_step: float,
+    max_parameter_step: float,
+    parameter_step_safety: float,
+    s_min: float,
+) -> float:
+    scale = parameter_step_safety * max_parameter_step / parameter_step
+    return max(arc_length_step * scale, s_min)
 
 
 def _prepare_structured_parameter_blocks(
