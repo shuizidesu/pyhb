@@ -27,9 +27,18 @@ The core package depends only on NumPy and SciPy. Torch is optional and is loade
 - `pyhb/` contains the publishable Python package.
 - `pyhb.models` defines the public model interfaces and structured term dataclasses used by the solvers.
 - `examples/` contains runnable reference systems. These models are part of the source release examples, not public library API.
-- `tests/`, MATLAB reference material, generated results, caches, and local reference PDFs are not part of the installed wheel.
 
-The wheel built from this project installs only `pyhb/*.py` and package metadata. Source releases and git checkouts include the tracked examples so the reference systems can be run and inspected.
+The wheel built from this project installs only `pyhb/*.py` and package metadata. Source checkouts include the tracked examples so the reference systems can be run and inspected.
+
+## Public API
+
+The main solver and postprocessing entry points are:
+
+- `ContinuationSolver` for full-system analytical nonlinear Jacobians.
+- `ContinuationAutodiffSolver` for full-system Torch autodiff nonlinear derivatives.
+- `CondensedContinuationSolver` for localized nonlinearities with Schur condensation.
+- `compute_floquet` for analytical-model Floquet stability postprocessing.
+- `compute_floquet_autodiff` for Torch autodiff Floquet stability postprocessing.
 
 ## Minimal Use
 
@@ -60,13 +69,3 @@ python -m examples.machine_absorber.postprocess_arc
 ```
 
 Example model files define system-specific data and nonlinear laws. Solver settings, output paths, and plotting choices belong in run or postprocess scripts.
-
-## Development
-
-Use the project regression command:
-
-```powershell
-D:\anaconda3\envs\pytorch_main\python.exe -m unittest discover -s tests -v
-```
-
-Ruff configuration is in `pyproject.toml`; install the `dev` extra if Ruff is not already available.
