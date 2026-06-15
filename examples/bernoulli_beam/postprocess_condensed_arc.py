@@ -18,19 +18,21 @@ from examples.bernoulli_beam.run_condensed_arc import DEFAULT_PLOT_DOFS, FREQUEN
 
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "condensed_arc.npz"
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "condensed_arc.png"
+DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "condensed_arc.png"
+DEFAULT_OUTPUT_RMS = Path(__file__).resolve().parent / "results" / "condensed_arc_rms.npz"
+DEFAULT_OUTPUT_FLOQUET = Path(__file__).resolve().parent / "results" / "condensed_arc_floquet.npz"
 DEFAULT_SAMPLE_COUNT = 4096
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Postprocess the condensed Bernoulli beam continuation result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FIG)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--dofs", type=int, nargs="+", default=DEFAULT_PLOT_DOFS)
-    parser.add_argument("--rms-output", type=Path, default=None)
+    parser.add_argument("--rms-output", type=Path, default=DEFAULT_OUTPUT_RMS)
     parser.add_argument("--no-stability", action="store_true")
-    parser.add_argument("--stability-output", type=Path, default=None)
+    parser.add_argument("--stability-output", type=Path, default=DEFAULT_OUTPUT_FLOQUET)
     parser.add_argument("--hsu-samples", type=int, default=512)
     parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="trapezoid")
     parser.add_argument("--stability-tolerance", type=float, default=1e-4)
@@ -151,12 +153,22 @@ def run_from_args(args: argparse.Namespace) -> None:
     save_plot(parameter_history, rms_history, dofs, args.output, stable_history)
     if args.rms_output is not None:
         args.rms_output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(args.rms_output, np.column_stack((parameter_history, rms_history)))
+        np.savez(
+            args.rms_output,
+            omega=parameter_history,
+            rms_history=rms_history,
+            dofs=np.asarray(dofs, dtype=np.int64),
+        )
         print(f"Saved RMS table to {args.rms_output}")
     stability_output = getattr(args, "stability_output", None)
     if stability_output is not None and spectral_radius is not None and stable_history is not None:
         stability_output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(stability_output, np.column_stack((parameter_history, spectral_radius, stable_history.astype(np.float64))))
+        np.savez(
+            stability_output,
+            omega=parameter_history,
+            spectral_radius=spectral_radius,
+            stable_flag=stable_history,
+        )
         print(f"Saved stability table to {stability_output}")
 
 

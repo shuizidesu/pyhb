@@ -26,7 +26,7 @@ DELTA_TOLERANCE = 1e-10
 Q_SCALE = 1.0
 OMEGA_SCALE = 1.0
 MAX_PARAMETER_STEP = 0.1
-HARMONICS = tuple(float(value) for value in range(1, 10))
+HARMONICS = tuple(float(value) for value in range(1, 21))
 DEFAULT_PLOT_DOFS = (0, 1)
 
 

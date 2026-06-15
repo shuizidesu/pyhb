@@ -18,20 +18,21 @@ from examples.bilinear_hysteretic.run_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RE
 
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.png"
+DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "arc.png"
+DEFAULT_OUTPUT_RMS = Path(__file__).resolve().parent / "results" / "arc_rms.npz"
+DEFAULT_OUTPUT_FLOQUET = Path(__file__).resolve().parent / "results" / "arc_floquet.npz"
 DEFAULT_SAMPLE_COUNT = 2048
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Postprocess the bilinear hysteretic continuation result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FIG)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--dofs", type=int, nargs="+", default=DEFAULT_PLOT_DOFS)
-    parser.add_argument("--amplitude-output", type=Path, default=None)
-    parser.add_argument("--rms-output", type=Path, default=None)
+    parser.add_argument("--rms-output", type=Path, default=DEFAULT_OUTPUT_RMS)
     parser.add_argument("--no-stability", action="store_true")
-    parser.add_argument("--stability-output", type=Path, default=None)
+    parser.add_argument("--stability-output", type=Path, default=DEFAULT_OUTPUT_FLOQUET)
     parser.add_argument("--hsu-samples", type=int, default=512)
     parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="trapezoid")
     parser.add_argument("--stability-tolerance", type=float, default=1e-2)
@@ -50,15 +51,6 @@ def compute_response_history(
     return np.einsum("to,sod->std", hb_item, selected_coefficients)
 
 
-def compute_amplitude_history(
-    coefficient_history: NDArray[np.float64],
-    dofs: tuple[int, ...],
-    sample_count: int,
-) -> NDArray[np.float64]:
-    response = compute_response_history(coefficient_history, dofs, sample_count)
-    return np.max(np.abs(response), axis=1)
-
-
 def compute_rms_history(
     coefficient_history: NDArray[np.float64],
     dofs: tuple[int, ...],
@@ -70,7 +62,7 @@ def compute_rms_history(
 
 def save_plot(
     parameter_history: NDArray[np.float64],
-    amplitude_history: NDArray[np.float64],
+    rms_history: NDArray[np.float64],
     dofs: tuple[int, ...],
     output: Path,
     stable_history: NDArray[np.bool_] | None = None,
@@ -80,9 +72,9 @@ def save_plot(
     output.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots()
     for column, dof in enumerate(dofs):
-        _plot_curve(ax, parameter_history, amplitude_history[:, column], f"DOF {dof + 1}", stable_history)
+        _plot_curve(ax, parameter_history, rms_history[:, column], f"DOF {dof + 1}", stable_history)
     ax.set_xlabel("omega")
-    ax.set_ylabel("Displacement amplitude")
+    ax.set_ylabel("RMS amplitude")
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -165,7 +157,7 @@ def run_from_args(args: argparse.Namespace) -> None:
         parameter_history = np.asarray(data["parameter_history"], dtype=np.float64)
         coefficient_history = np.asarray(data["coefficient_history"], dtype=np.float64)
     dofs = tuple(int(dof) for dof in args.dofs)
-    amplitude_history = compute_amplitude_history(coefficient_history, dofs, args.sample_count)
+    rms_history = compute_rms_history(coefficient_history, dofs, args.sample_count)
     spectral_radius = None
     stable_history = None
     if not getattr(args, "no_stability", False):
@@ -176,24 +168,25 @@ def run_from_args(args: argparse.Namespace) -> None:
             getattr(args, "floquet_method", "trapezoid"),
             getattr(args, "stability_tolerance", 1e-4),
         )
-    save_plot(parameter_history, amplitude_history, dofs, args.output, stable_history)
-    amplitude_output = getattr(args, "amplitude_output", None)
-    if amplitude_output is not None:
-        amplitude_output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(amplitude_output, np.column_stack((parameter_history, amplitude_history)))
-        print(f"Saved amplitude table to {amplitude_output}")
+    save_plot(parameter_history, rms_history, dofs, args.output, stable_history)
     rms_output = getattr(args, "rms_output", None)
     if rms_output is not None:
-        rms_history = compute_rms_history(coefficient_history, dofs, args.sample_count)
         rms_output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(rms_output, np.column_stack((parameter_history, rms_history)))
+        np.savez(
+            rms_output,
+            omega=parameter_history,
+            rms_history=rms_history,
+            dofs=np.asarray(dofs, dtype=np.int64),
+        )
         print(f"Saved RMS table to {rms_output}")
     stability_output = getattr(args, "stability_output", None)
     if stability_output is not None and spectral_radius is not None and stable_history is not None:
         stability_output.parent.mkdir(parents=True, exist_ok=True)
-        np.save(
+        np.savez(
             stability_output,
-            np.column_stack((parameter_history, spectral_radius, stable_history.astype(np.float64))),
+            omega=parameter_history,
+            spectral_radius=spectral_radius,
+            stable_flag=stable_history,
         )
         print(f"Saved stability table to {stability_output}")
 

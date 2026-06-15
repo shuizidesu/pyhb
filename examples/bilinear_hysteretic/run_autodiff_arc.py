@@ -27,7 +27,7 @@ Q_SCALE = 1.0
 OMEGA_SCALE = 1.0
 MAX_PARAMETER_STEP = 0.02
 EQUIVALENT_LINEAR_STIFFNESS = 10.0
-HARMONICS = tuple(float(value) for value in range(1, 10))
+HARMONICS = tuple(float(value) for value in range(1, 21))
 DEFAULT_PLOT_DOFS = (0,)
 
 
