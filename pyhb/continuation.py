@@ -393,8 +393,8 @@ class ContinuationSolver:
         tangent = self._initial_tangent(jacobian, j_parameter)
         y0 = np.concatenate((coeff_line, np.array([parameter], dtype=np.float64)))
 
-        parameter_history: list[float] = []
-        coefficient_history: list[NDArray[np.float64]] = []
+        parameter_history: list[float] = [float(parameter)] if initial_log.converged else []
+        coefficient_history: list[NDArray[np.float64]] = [coeff.copy()] if initial_log.converged else []
         logs: list[StepLog] = []
         arc_length_step = float(config.s_initial)
         shrink_count = 0

@@ -421,9 +421,15 @@ class CondensedContinuationSolver:
         tangent = self._initial_tangent(jacobian, parameter_column)
         y0 = np.concatenate((nonlinear_vector, np.array([parameter], dtype=np.float64)))
 
-        parameter_history: list[float] = []
-        coefficient_history: list[NDArray[np.float64]] = []
-        nonlinear_coefficient_history: list[NDArray[np.float64]] = []
+        initial_full_coefficients = self._recover_full_coefficients(nonlinear_vector, linear_state)
+        initial_nonlinear_coefficients = unflatten_coefficients(
+            nonlinear_vector,
+            self.prepared.context.order,
+            len(self.prepared.nonlinear_dofs),
+        )
+        parameter_history: list[float] = [float(parameter)]
+        coefficient_history: list[NDArray[np.float64]] = [initial_full_coefficients.copy()]
+        nonlinear_coefficient_history: list[NDArray[np.float64]] = [initial_nonlinear_coefficients.copy()]
         logs: list[CondensedContinuationLog] = []
         arc_length_step = float(self.config.s_initial)
         shrink_count = 0
