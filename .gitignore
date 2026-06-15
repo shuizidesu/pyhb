@@ -16,6 +16,8 @@ dist/
 
 examples/results/
 examples/*/results/
+examples/four_dof_fractional/
+examples/four_dof_integer/
 
 tests/
 matlab_references/
