@@ -378,7 +378,23 @@ class ContinuationSolver:
         if initial_coefficients is None:
             raise ValueError("initial_coefficients must be provided")
         initial = np.asarray(initial_coefficients, dtype=np.float64)
-        coeff_line = flatten_coefficients(initial) if initial.ndim == 2 else initial.reshape(-1)
+        expected_shape = (order, self.model.n_dof)
+        expected_size = order * self.model.n_dof
+        if initial.ndim == 2:
+            if initial.shape != expected_shape:
+                raise ValueError(f"initial_coefficients must have shape {expected_shape}, got {initial.shape}")
+            coeff_line = flatten_coefficients(initial)
+        elif initial.ndim == 1:
+            if initial.size != expected_size:
+                raise ValueError(
+                    f"initial_coefficients must have length {expected_size}, got {initial.size}"
+                )
+            coeff_line = initial.reshape(-1)
+        else:
+            raise ValueError(
+                "initial_coefficients must be a 1D coefficient vector or "
+                f"a 2D coefficient matrix shaped {expected_shape}, got {initial.shape}"
+            )
 
         parameter = float(config.init_omega if initial_parameter is None else initial_parameter)
         coeff_line, coeff, x, dx, jacobian, initial_log = self._solve_initial(coeff_line, parameter)

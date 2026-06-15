@@ -269,7 +269,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
             active_ddx = active_variable if variable == "ddx" else local_ddx
             return self._call_torch_force(t, active_x, active_dx, active_ddx, parameter).sum(dim=0)
 
-        jacobian = jacrev(summed_force)(locals()[f"local_{variable}"])
+        jacobian = jacrev(summed_force)(_select_variable(variable, local_x, local_dx, local_ddx))
         return jacobian.permute(1, 0, 2).contiguous()
 
     def _differentiate_parameter(
@@ -301,6 +301,21 @@ def _validate_autodiff_variables(variables: tuple[JacobianVariable, ...]) -> tup
     if unsupported:
         raise ValueError(f"unsupported autodiff variable(s): {sorted(unsupported)}")
     return normalized
+
+
+def _select_variable(
+    variable: JacobianVariable,
+    local_x: torch.Tensor,
+    local_dx: torch.Tensor,
+    local_ddx: torch.Tensor,
+) -> torch.Tensor:
+    if variable == "x":
+        return local_x
+    if variable == "dx":
+        return local_dx
+    if variable == "ddx":
+        return local_ddx
+    raise ValueError(f"unsupported autodiff variable {variable!r}")
 
 
 def _as_torch(values: NDArray[np.float64], device: torch.device) -> torch.Tensor:

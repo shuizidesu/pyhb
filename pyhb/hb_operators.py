@@ -24,6 +24,17 @@ class FrequencyGrid:
     frequency_resolution: float = 1.0
     tolerance: float = 1e-10
 
+    def __post_init__(self) -> None:
+        frequency_resolution = float(self.frequency_resolution)
+        tolerance = float(self.tolerance)
+        if not np.isfinite(frequency_resolution) or frequency_resolution <= 0.0:
+            raise ValueError(
+                "frequency_resolution must be a positive finite value, "
+                f"got {self.frequency_resolution!r}"
+            )
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError(f"tolerance must be a non-negative finite value, got {self.tolerance!r}")
+
     @property
     def period(self) -> float:
         return 2.0 * np.pi / self.frequency_resolution

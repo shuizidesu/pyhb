@@ -30,8 +30,6 @@ __all__ = [
     "CondensedContinuationResult",
     "CondensedContinuationSolver",
     "AutodiffSecondOrderTimeModel",
-    "ContinuationAutodiffConfig",
-    "ContinuationAutodiffSolver",
     "ContinuationConfig",
     "ContinuationResult",
     "ContinuationSolver",
@@ -45,7 +43,6 @@ __all__ = [
     "SecondOrderTimeModel",
     "build_full_fft_nonlinear_harmonics",
     "compute_floquet",
-    "compute_floquet_autodiff",
 ]
 
 

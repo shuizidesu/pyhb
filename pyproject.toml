@@ -8,6 +8,19 @@ version = "0.1.0"
 description = "pyHB harmonic-balance tools for nonlinear dynamic response analysis."
 readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "LicenseRef-Proprietary" }
+authors = [
+    { name = "pyHB contributors" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = [
     "numpy",
     "scipy",
@@ -23,6 +36,11 @@ autodiff = [
 dev = [
     "ruff",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shuizidesu/pyhb"
+Repository = "https://github.com/shuizidesu/pyhb"
+Issues = "https://github.com/shuizidesu/pyhb/issues"
 
 [tool.setuptools.packages.find]
 include = ["pyhb*"]
