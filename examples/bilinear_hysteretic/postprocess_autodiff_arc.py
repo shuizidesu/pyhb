@@ -91,7 +91,7 @@ def compute_stability_history(
     floquet_method: str,
     stability_tolerance: float,
     torch_device: str | None,
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.complex128]]:
     model = BilinearHystereticAutodiffModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
@@ -100,6 +100,7 @@ def compute_stability_history(
     )
     spectral_radius = []
     stable = []
+    multipliers = []
     total = int(parameter_history.size)
     print(f"Computing Floquet stability... points={total}, method={floquet_method}, samples={hsu_samples}")
     for index, (parameter, coefficients) in enumerate(
@@ -122,7 +123,12 @@ def compute_stability_history(
         )
         spectral_radius.append(result.spectral_radius)
         stable.append(result.stable)
-    return np.asarray(spectral_radius, dtype=np.float64), np.asarray(stable, dtype=np.bool_)
+        multipliers.append(result.multipliers)
+    return (
+        np.asarray(spectral_radius, dtype=np.float64),
+        np.asarray(stable, dtype=np.bool_),
+        np.asarray(multipliers, dtype=np.complex128),
+    )
 
 
 def _plot_curve(
@@ -163,8 +169,9 @@ def run_from_args(args: argparse.Namespace) -> None:
     rms_history = compute_rms_history(coefficient_history, dofs, args.sample_count)
     spectral_radius = None
     stable_history = None
+    multiplier_history = None
     if not getattr(args, "no_stability", False):
-        spectral_radius, stable_history = compute_stability_history(
+        spectral_radius, stable_history, multiplier_history = compute_stability_history(
             parameter_history,
             coefficient_history,
             getattr(args, "hsu_samples", 512),
@@ -184,13 +191,19 @@ def run_from_args(args: argparse.Namespace) -> None:
         )
         print(f"Saved RMS table to {rms_output}")
     stability_output = getattr(args, "stability_output", None)
-    if stability_output is not None and spectral_radius is not None and stable_history is not None:
+    if (
+        stability_output is not None
+        and spectral_radius is not None
+        and stable_history is not None
+        and multiplier_history is not None
+    ):
         stability_output.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             stability_output,
             omega=parameter_history,
             spectral_radius=spectral_radius,
             stable_flag=stable_history,
+            multipliers=multiplier_history,
         )
         print(f"Saved stability table to {stability_output}")
 
