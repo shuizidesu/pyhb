@@ -17,8 +17,8 @@ from examples.vanderpol.model import VanderpolModel
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "free_frequency.npz"
 DEFAULT_MAX_STEPS = 80
-DEFAULT_SAMPLE_FFT = 2**10
-HARMONICS = tuple(float(value) for value in range(1, 10))
+DEFAULT_SAMPLE_FFT = 2**11
+HARMONICS = tuple(float(value) for value in range(1, 51))
 FREQUENCY_RESOLUTION = 1.0
 INIT_OMEGA = 1.0
 INIT_PARAMETER = 0.5
@@ -56,7 +56,7 @@ def build_config(args: argparse.Namespace) -> FreeFrequencyContinuationConfig:
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
         parameter_scale=PARAMETER_SCALE,
-        max_parameter_step=0.1,
+        max_parameter_step=0.3,
         max_steps=args.max_steps,
         constraint=HarmonicCoefficientConstraint(dof=0, coefficient_index=1, value=0.0),
         progress_callback=print,
@@ -66,7 +66,8 @@ def build_config(args: argparse.Namespace) -> FreeFrequencyContinuationConfig:
 def build_initial_coefficients(order: int) -> NDArray[np.float64]:
     coefficients = np.zeros((order, 1), dtype=np.float64)
     harmonic_count = (order - 1) // 2
-    coefficients[1 + harmonic_count, 0] = 2.0
+    coefficients[1, 0] = 1.0
+    coefficients[1 + harmonic_count, 0] = 1.0
     return coefficients
 
 

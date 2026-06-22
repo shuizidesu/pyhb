@@ -10,9 +10,8 @@ from numpy.typing import NDArray
 from scipy import sparse
 from scipy.sparse.linalg import splu
 
-from .continuation import (
-    ContinuationConfig,
-    ContinuationSolver,
+from .continuation import ContinuationConfig, ContinuationSolver
+from .continuation_core import (
     _parameter_step_too_large,
     _residual_stats,
     _shrink_arc_length_for_parameter_step,

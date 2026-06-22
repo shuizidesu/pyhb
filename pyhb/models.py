@@ -97,7 +97,7 @@ class SecondOrderTimeModel(ABC):
     The continuation solver projects this time-domain residual into HB
     coefficient space. Models describe nonlinearities locally; the base class
     scatters local forces and Jacobian terms to global DOFs for full-system
-    solvers, while condensed solvers can consume the local form directly.
+    solvers.
     """
 
     @property

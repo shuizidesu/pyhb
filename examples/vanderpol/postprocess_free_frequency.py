@@ -34,7 +34,7 @@ def compute_rms_history(coefficient_history: NDArray[np.float64], sample_count: 
     period = 2.0 * np.pi / FREQUENCY_RESOLUTION
     t = np.arange(sample_count, dtype=np.float64) * (period / sample_count)
     hb_item, _, _ = generate_hb_items(t, HARMONICS)
-    response = np.einsum("to,sod->sd", hb_item, coefficient_history)
+    response = np.einsum("to,sod->std", hb_item, coefficient_history)
     return np.sqrt(np.mean(response * response, axis=1))
 
 

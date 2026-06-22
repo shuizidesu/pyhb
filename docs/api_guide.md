@@ -30,8 +30,9 @@ Most users start from objects exported by `pyhb.__init__`:
 
 - `SecondOrderTimeModel` and `AutodiffSecondOrderTimeModel` define model
   interfaces.
-- `ContinuationSolver`, `ContinuationAutodiffSolver`, and
-  `CondensedContinuationSolver` run harmonic-balance continuation.
+- `ContinuationSolver`, `ContinuationAutodiffSolver`,
+  `FreeFrequencyContinuationSolver`, and
+  `FreeFrequencyContinuationAutodiffSolver` run harmonic-balance continuation.
 - `compute_floquet` and `compute_floquet_autodiff` compute Floquet multipliers
   for accepted HB solutions.
 - `FrequencyGrid` and `build_full_fft_nonlinear_harmonics` expose the frequency
@@ -49,8 +50,10 @@ Lower-level modules provide the assembly building blocks used by the solvers:
   correction matrix, then runs weighted arc-length continuation.
 - `pyhb.continuation_autodiff` reuses the full continuation loop but obtains
   nonlinear derivatives from Torch autodiff.
-- `pyhb.condensed_continuation` eliminates linear-only DOFs by Schur
-  condensation and continues the reduced nonlinear coordinates.
+- `pyhb.free_frequency` handles autonomous/free-frequency systems where the
+  response frequency is an unknown.
+- `pyhb.free_frequency_autodiff` applies Torch autodiff to the same
+  free-frequency continuation loop.
 - `pyhb.floquet` reconstructs one HB solution, samples analytical nonlinear
   Jacobians in time, and computes monodromy multipliers.
 - `pyhb.floquet_autodiff` uses Torch autodiff to build the same sampled
@@ -139,9 +142,9 @@ iterations begin:
 - the raw S3 matrix;
 - `s3_tensor_x`, `s3_tensor_dx`, and `s3_tensor_ddx`.
 
-The full and condensed solvers keep this context in their prepared problem
-objects. The autodiff continuation solver uses the same context; only the source
-of nonlinear derivative samples changes.
+The continuation solvers keep this context in their prepared problem objects.
+The autodiff continuation solvers use the same context; only the source of
+nonlinear derivative samples changes.
 
 ### Linear Projection Matrices
 
@@ -214,8 +217,7 @@ Optional method:
   `dN/dparameter` samples. The default is zero.
 
 The base class scatters local nonlinear force and Jacobian data to global DOFs
-for full-system solvers. The condensed solver also uses the local DOF metadata
-directly.
+for full-system solvers.
 
 ### LinearOperatorTerm
 
@@ -434,41 +436,6 @@ column.
 derivatives controlled by `autodiff_variables`, `autodiff_omega_dependent`, and
 `autodiff_parameter_dependent`.
 
-## Condensed Continuation
-
-Use `CondensedContinuationSolver` for localized nonlinearities where the
-linear-only DOFs can be eliminated by Schur condensation.
-
-```python
-from pyhb import CondensedContinuationConfig, CondensedContinuationSolver
-
-config = CondensedContinuationConfig(
-    sample_fft=32768,
-    harmonics=(1.0, 1.2),
-    frequency_resolution=0.1,
-)
-
-result = CondensedContinuationSolver(model, config).run(initial_coefficients)
-```
-
-The model interface is still `SecondOrderTimeModel`, but the DOF metadata is
-especially important:
-
-- `nonlinear_force_dofs` selects where local nonlinear forces enter.
-- `nonlinear_coordinate_dofs` selects the coordinates that drive the nonlinear
-  law.
-- The condensed nonlinear state is formed from the ordered union of those DOFs.
-
-`CondensedContinuationConfig` has the same conceptual controls as
-`ContinuationConfig`, with defaults tuned for condensed localized problems.
-
-`CondensedContinuationResult` contains:
-
-- `parameter_history`: accepted continuation parameters.
-- `coefficient_history`: recovered full coefficient history.
-- `nonlinear_coefficient_history`: condensed nonlinear-DOF coefficient history.
-- `logs` and `initial_log`: diagnostics.
-
 ## Floquet Stability
 
 Floquet stability is postprocessing for one accepted HB solution point. It does
@@ -528,10 +495,10 @@ Runnable reference systems live under `examples/<system>/`. Typical scripts are:
 
 - `run_arc.py`: full analytical continuation.
 - `run_autodiff_arc.py`: Torch autodiff continuation.
-- `run_condensed_arc.py`: condensed continuation when available.
-- `postprocess_arc.py`, `postprocess_autodiff_arc.py`,
-  `postprocess_condensed_arc.py`: response reconstruction, plots, and optional
-  stability tables.
+- `run_free_frequency.py`: free-frequency continuation for autonomous systems.
+- `postprocess_arc.py`, `postprocess_autodiff_arc.py`, and related
+  postprocess scripts: response reconstruction, plots, and optional stability
+  tables.
 
 Example run scripts save minimal `.npz` payloads with `parameter_history` and
 `coefficient_history`. Postprocess scripts reconstruct time responses from the

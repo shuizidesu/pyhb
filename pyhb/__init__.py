@@ -1,12 +1,6 @@
 """Generic pyHB harmonic-balance tools for nonlinear dynamics."""
 
 from .continuation import ContinuationConfig, ContinuationResult, ContinuationSolver
-from .condensed_continuation import (
-    CondensedContinuationConfig,
-    CondensedContinuationLog,
-    CondensedContinuationResult,
-    CondensedContinuationSolver,
-)
 from .floquet import FloquetConfig, FloquetResult, compute_floquet
 from .free_frequency import (
     FreeFrequencyContinuationConfig,
@@ -37,10 +31,6 @@ _AUTODIFF_EXPORTS = {
 }
 
 __all__ = [
-    "CondensedContinuationConfig",
-    "CondensedContinuationLog",
-    "CondensedContinuationResult",
-    "CondensedContinuationSolver",
     "AutodiffSecondOrderTimeModel",
     "ContinuationConfig",
     "ContinuationResult",
