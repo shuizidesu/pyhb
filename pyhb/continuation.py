@@ -12,7 +12,7 @@ from scipy.sparse.linalg import splu
 
 from .harmonics import coefficient_matrix_from_fft, flatten_coefficients, generate_hb_items, stack_fft_coefficients, unflatten_coefficients
 from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics, harmonic_integral_matrices
-from .models import SecondOrderTimeModel
+from .models import NonlinearJacobianTerm, SecondOrderTimeModel
 
 
 @dataclass(frozen=True)
@@ -208,70 +208,13 @@ class ContinuationSolver:
         ddx: NDArray[np.float64],
         parameter: float,
     ) -> sparse.csc_matrix:
-        context = self.prepared.context
-        order = context.order
-        size = self.model.n_dof * order
         terms = tuple(self.model.nonlinear_jacobian_terms(self.prepared.t, x, dx, ddx, parameter))
-        if not terms:
-            return sparse.csc_matrix((size, size), dtype=np.float64)
-
-        tensor_by_variable = {
-            "x": context.s3_tensor_x,
-            "dx": context.s3_tensor_dx,
-            "ddx": context.s3_tensor_ddx,
-        }
-
-        force_dofs = np.empty(len(terms), dtype=np.int64)
-        coordinate_dofs = np.empty(len(terms), dtype=np.int64)
-        variables: list[str] = []
-        values = np.empty((self.prepared.t.size, len(terms)), dtype=np.float64)
-
-        for index, term in enumerate(terms):
-            if term.variable not in tensor_by_variable:
-                raise ValueError(f"unsupported nonlinear Jacobian variable {term.variable!r}")
-            if not (0 <= term.force_dof < self.model.n_dof):
-                raise ValueError(f"force_dof out of range: {term.force_dof}")
-            if not (0 <= term.coordinate_dof < self.model.n_dof):
-                raise ValueError(f"coordinate_dof out of range: {term.coordinate_dof}")
-            term_values = np.asarray(term.values, dtype=np.float64).reshape(-1)
-            if term_values.shape[0] != self.prepared.t.size:
-                raise ValueError(
-                    "nonlinear Jacobian term values must have one value per time sample; "
-                    f"got {term_values.shape[0]}, expected {self.prepared.t.size}"
-                )
-            force_dofs[index] = term.force_dof
-            coordinate_dofs[index] = term.coordinate_dof
-            variables.append(term.variable)
-            values[:, index] = term_values
-
-        coeffs = coefficient_matrix_from_fft(
-            values,
-            context.nonlinear_harmonics,
-            context.sample_count,
-            context.nonlinear_harmonic_indices,
+        return assemble_hb_jacobian_from_terms(
+            terms,
+            self.prepared.context,
+            self.prepared.t.size,
+            self.model.n_dof,
         )
-        row_offsets = np.arange(order, dtype=np.int64)
-        col_offsets = np.arange(order, dtype=np.int64)
-        row_chunks: list[NDArray[np.int64]] = []
-        col_chunks: list[NDArray[np.int64]] = []
-        data_chunks: list[NDArray[np.float64]] = []
-
-        for variable, s_tensor in tensor_by_variable.items():
-            term_indices = np.asarray([index for index, term_variable in enumerate(variables) if term_variable == variable], dtype=np.int64)
-            if term_indices.size == 0:
-                continue
-            blocks = np.einsum("abk,kt->abt", s_tensor, coeffs[:, term_indices])
-            term_blocks = np.moveaxis(blocks, 2, 0)
-            row_indices = force_dofs[term_indices, None, None] * order + row_offsets[None, :, None]
-            col_indices = coordinate_dofs[term_indices, None, None] * order + col_offsets[None, None, :]
-            row_chunks.append(np.broadcast_to(row_indices, term_blocks.shape).reshape(-1))
-            col_chunks.append(np.broadcast_to(col_indices, term_blocks.shape).reshape(-1))
-            data_chunks.append(term_blocks.reshape(-1))
-
-        rows = np.concatenate(row_chunks)
-        cols = np.concatenate(col_chunks)
-        data = np.concatenate(data_chunks)
-        return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
 
     def _parameter_jacobian(
         self,
@@ -551,6 +494,82 @@ class ContinuationSolver:
 
         return self._run_full(initial_coefficients, initial_parameter)
 
+
+def assemble_hb_jacobian_from_terms(
+    terms: tuple[NonlinearJacobianTerm, ...],
+    context: HBContext,
+    sample_count: int,
+    n_dof: int,
+) -> sparse.csc_matrix:
+    """Assemble time-domain local Jacobian samples into a global HB Jacobian."""
+
+    order = context.order
+    size = n_dof * order
+    if not terms:
+        return sparse.csc_matrix((size, size), dtype=np.float64)
+
+    tensor_by_variable = {
+        "x": context.s3_tensor_x,
+        "dx": context.s3_tensor_dx,
+        "ddx": context.s3_tensor_ddx,
+    }
+
+    force_dofs = np.empty(len(terms), dtype=np.int64)
+    coordinate_dofs = np.empty(len(terms), dtype=np.int64)
+    variables: list[str] = []
+    values = np.empty((sample_count, len(terms)), dtype=np.float64)
+
+    for index, term in enumerate(terms):
+        if term.variable not in tensor_by_variable:
+            raise ValueError(f"unsupported nonlinear Jacobian variable {term.variable!r}")
+        if not (0 <= term.force_dof < n_dof):
+            raise ValueError(f"force_dof out of range: {term.force_dof}")
+        if not (0 <= term.coordinate_dof < n_dof):
+            raise ValueError(f"coordinate_dof out of range: {term.coordinate_dof}")
+        term_values = np.asarray(term.values, dtype=np.float64).reshape(-1)
+        if term_values.shape[0] != sample_count:
+            raise ValueError(
+                "nonlinear Jacobian term values must have one value per time sample; "
+                f"got {term_values.shape[0]}, expected {sample_count}"
+            )
+        force_dofs[index] = term.force_dof
+        coordinate_dofs[index] = term.coordinate_dof
+        variables.append(term.variable)
+        values[:, index] = term_values
+
+    coeffs = coefficient_matrix_from_fft(
+        values,
+        context.nonlinear_harmonics,
+        context.sample_count,
+        context.nonlinear_harmonic_indices,
+    )
+    row_offsets = np.arange(order, dtype=np.int64)
+    col_offsets = np.arange(order, dtype=np.int64)
+    row_chunks: list[NDArray[np.int64]] = []
+    col_chunks: list[NDArray[np.int64]] = []
+    data_chunks: list[NDArray[np.float64]] = []
+
+    for variable, s_tensor in tensor_by_variable.items():
+        term_indices = np.asarray(
+            [index for index, term_variable in enumerate(variables) if term_variable == variable],
+            dtype=np.int64,
+        )
+        if term_indices.size == 0:
+            continue
+        blocks = np.einsum("abk,kt->abt", s_tensor, coeffs[:, term_indices])
+        term_blocks = np.moveaxis(blocks, 2, 0)
+        row_indices = force_dofs[term_indices, None, None] * order + row_offsets[None, :, None]
+        col_indices = coordinate_dofs[term_indices, None, None] * order + col_offsets[None, None, :]
+        row_chunks.append(np.broadcast_to(row_indices, term_blocks.shape).reshape(-1))
+        col_chunks.append(np.broadcast_to(col_indices, term_blocks.shape).reshape(-1))
+        data_chunks.append(term_blocks.reshape(-1))
+
+    rows = np.concatenate(row_chunks)
+    cols = np.concatenate(col_chunks)
+    data = np.concatenate(data_chunks)
+    return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
+
+
 def _validate_positive_scale(name: str, value: float) -> None:
     scale = float(value)
     if not np.isfinite(scale) or scale <= 0.0:
@@ -601,7 +620,7 @@ def _prepare_structured_parameter_blocks(
         expected_matrix_shape = (model.n_dof, model.n_dof)
         if matrix.shape != expected_matrix_shape:
             raise ValueError(f"linear operator matrix must have shape {expected_matrix_shape}, got {matrix.shape}")
-        power = _validated_parameter_power(term.parameter_power)
+        power = _validated_omega_power(term.omega_power)
         _add_powered_sparse_block(
             operator_blocks,
             power,
@@ -617,7 +636,7 @@ def _prepare_structured_parameter_blocks(
         expected_samples_shape = (t.size, model.n_dof)
         if samples.shape != expected_samples_shape:
             raise ValueError(f"forcing term samples must have shape {expected_samples_shape}, got {samples.shape}")
-        power = _validated_parameter_power(term.parameter_power)
+        power = _validated_omega_power(term.omega_power)
         coefficients = stack_fft_coefficients(
             samples,
             context.harmonics,
@@ -629,10 +648,10 @@ def _prepare_structured_parameter_blocks(
     return operator_blocks, forcing_blocks
 
 
-def _validated_parameter_power(power: float) -> float:
+def _validated_omega_power(power: float) -> float:
     value = float(power)
     if not np.isfinite(value):
-        raise ValueError(f"parameter_power must be finite, got {power!r}")
+        raise ValueError(f"omega_power must be finite, got {power!r}")
     return value
 
 

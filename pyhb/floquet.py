@@ -369,7 +369,7 @@ def _combine_sparse_time_operator_matrices(
         matrix = sparse.csc_matrix(term.matrix, dtype=np.float64)
         if matrix.shape != (n_dof, n_dof):
             raise ValueError(f"linear operator matrix must have shape {(n_dof, n_dof)}, got {matrix.shape}")
-        matrices[term.basis_type] = matrices[term.basis_type] + float(parameter) ** float(term.parameter_power) * matrix
+        matrices[term.basis_type] = matrices[term.basis_type] + float(parameter) ** float(term.omega_power) * matrix
     return matrices["ddx"].tocsc(), matrices["dx"].tocsc(), matrices["x"].tocsc()
 
 

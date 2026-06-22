@@ -733,7 +733,7 @@ def _prepare_structured_parameter_blocks(
         expected_matrix_shape = (model.n_dof, model.n_dof)
         if matrix.shape != expected_matrix_shape:
             raise ValueError(f"linear operator matrix must have shape {expected_matrix_shape}, got {matrix.shape}")
-        power = _validated_parameter_power(term.parameter_power)
+        power = _validated_omega_power(term.omega_power)
         block = sparse.kron(matrix, basis_by_type[basis_type], format="csc")
         _add_powered_sparse_block(operator_blocks, power, block)
 
@@ -746,7 +746,7 @@ def _prepare_structured_parameter_blocks(
         expected_samples_shape = (t.size, model.n_dof)
         if samples.shape != expected_samples_shape:
             raise ValueError(f"forcing term samples must have shape {expected_samples_shape}, got {samples.shape}")
-        power = _validated_parameter_power(term.parameter_power)
+        power = _validated_omega_power(term.omega_power)
         coefficients = stack_fft_coefficients(
             samples,
             context.harmonics,
@@ -765,10 +765,10 @@ def _prepare_structured_parameter_blocks(
     )
 
 
-def _validated_parameter_power(power: float) -> float:
+def _validated_omega_power(power: float) -> float:
     value = float(power)
     if not np.isfinite(value):
-        raise ValueError(f"parameter_power must be finite, got {power!r}")
+        raise ValueError(f"omega_power must be finite, got {power!r}")
     return value
 
 
