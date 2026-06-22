@@ -5,33 +5,36 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from numpy.typing import NDArray
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import FreeFrequencyContinuationAutodiffConfig, FreeFrequencyContinuationAutodiffSolver
-from examples.vanderpol.autodiff_model import VanderpolAutodiffModel
-from examples.vanderpol.run_free_frequency import (
-    CONSTRAINT_TOLERANCE,
-    DEFAULT_MAX_STEPS,
-    DEFAULT_SAMPLE_FFT,
-    DELTA_TOLERANCE,
-    FREQUENCY_RESOLUTION,
-    HARMONICS,
-    INIT_OMEGA,
-    INIT_PARAMETER,
-    MAX_EPOCH,
-    OMEGA_SCALE,
-    PARAMETER_SCALE,
-    Q_SCALE,
-    RES_TOLERANCE,
-    build_initial_coefficients,
-    save_result,
+from pyhb import (
+    FreeFrequencyContinuationAutodiffConfig,
+    FreeFrequencyContinuationAutodiffSolver,
+    FreeFrequencyContinuationResult,
+    HarmonicCoefficientConstraint,
 )
+from examples.vanderpol.autodiff_model import VanderpolAutodiffModel
 
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency.npz"
+DEFAULT_MAX_STEPS = 80
+DEFAULT_SAMPLE_FFT = 2**11
+HARMONICS = tuple(float(value) for value in range(1, 51))
+FREQUENCY_RESOLUTION = 1.0
+INIT_OMEGA = 1.0
+INIT_PARAMETER = 0.5
+MAX_EPOCH = 30
+RES_TOLERANCE = 1e-10
+DELTA_TOLERANCE = 1e-11
+CONSTRAINT_TOLERANCE = 1e-10
+Q_SCALE = 1.0
+OMEGA_SCALE = 1.0
+PARAMETER_SCALE = 1.0
+MAX_PARAMETER_STEP = 0.3
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,20 +63,38 @@ def build_config(args: argparse.Namespace) -> FreeFrequencyContinuationAutodiffC
         q_scale=Q_SCALE,
         omega_scale=OMEGA_SCALE,
         parameter_scale=PARAMETER_SCALE,
-        max_parameter_step=0.1,
+        max_parameter_step=MAX_PARAMETER_STEP,
         max_steps=args.max_steps,
+        constraint=HarmonicCoefficientConstraint(dof=0, coefficient_index=1, value=0.0),
         torch_device=args.torch_device,
         progress_callback=print,
     )
+
+
+def build_initial_coefficients(order: int) -> NDArray[np.float64]:
+    coefficients = np.zeros((order, 1), dtype=np.float64)
+    harmonic_count = (order - 1) // 2
+    coefficients[1, 0] = 1.0
+    coefficients[1 + harmonic_count, 0] = 1.0
+    return coefficients
+
+
+def save_result(result: FreeFrequencyContinuationResult, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        output,
+        parameter_history=result.parameter_history,
+        omega_history=result.omega_history,
+        coefficient_history=result.coefficient_history,
+    )
+    print(f"Saved result to {output}")
 
 
 def run_from_args(args: argparse.Namespace) -> None:
     model = VanderpolAutodiffModel()
     config = build_config(args)
     order = 2 * len(HARMONICS) + 1
-    result = FreeFrequencyContinuationAutodiffSolver(model, config).run(
-        np.asarray(build_initial_coefficients(order), dtype=np.float64)
-    )
+    result = FreeFrequencyContinuationAutodiffSolver(model, config).run(build_initial_coefficients(order))
     save_result(result, args.output)
 
 
@@ -83,4 +104,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

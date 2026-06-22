@@ -11,7 +11,7 @@ from scipy import linalg, sparse
 from scipy.sparse.linalg import splu
 
 from .harmonics import generate_hb_items
-from .models import JacobianVariable, SecondOrderTimeModel
+from .models import FreeFrequencySecondOrderTimeModel, JacobianVariable, SecondOrderTimeModel
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,46 @@ def compute_floquet(
             samples.x,
             samples.dx,
             samples.ddx,
+            float(parameter),
+        ),
+        samples.t.size,
+        model.n_dof,
+    )
+    return compute_floquet_from_sampled_jacobians(
+        model,
+        samples,
+        jacobians,
+        active_config,
+    )
+
+
+def compute_free_frequency_floquet(
+    model: FreeFrequencySecondOrderTimeModel,
+    coefficients: NDArray[np.float64],
+    omega: float,
+    parameter: float,
+    harmonics: Sequence[float],
+    frequency_resolution: float,
+    config: FloquetConfig | None = None,
+) -> FloquetResult:
+    """Compute Floquet multipliers for one free-frequency HB solution."""
+
+    active_config = config or FloquetConfig()
+    samples = _prepare_solution_samples(
+        model,
+        coefficients,
+        omega,
+        harmonics,
+        frequency_resolution,
+        active_config,
+    )
+    jacobians = _sampled_jacobians_from_terms(
+        model.residual_jacobian_terms(
+            samples.t,
+            samples.x,
+            samples.dx,
+            samples.ddx,
+            float(omega),
             float(parameter),
         ),
         samples.t.size,

@@ -33,8 +33,8 @@ Most users start from objects exported by `pyhb.__init__`:
 - `ContinuationSolver`, `ContinuationAutodiffSolver`,
   `FreeFrequencyContinuationSolver`, and
   `FreeFrequencyContinuationAutodiffSolver` run harmonic-balance continuation.
-- `compute_floquet` and `compute_floquet_autodiff` compute Floquet multipliers
-  for accepted HB solutions.
+- `compute_floquet`, `compute_free_frequency_floquet`, and their autodiff
+  counterparts compute Floquet multipliers for accepted HB solutions.
 - `FrequencyGrid` and `build_full_fft_nonlinear_harmonics` expose the frequency
   grid tools that users commonly need when configuring solvers.
 
@@ -485,6 +485,13 @@ Floquet backend after nonlinear Jacobian samples have been prepared.
 - evaluates `model.local_nonlinear_force_torch(...)`;
 - uses Torch autodiff to obtain local sampled Jacobian arrays;
 - scatters those arrays to the same sparse sampled-Jacobian representation.
+
+For autonomous/free-frequency systems use
+`compute_free_frequency_floquet(...)` or
+`compute_free_frequency_floquet_autodiff(...)`. These functions take both the
+solved response frequency `omega` and the true continuation `parameter`; linear
+operator powers are evaluated with `omega`, while residual Jacobian samples are
+evaluated with `(omega, parameter)`.
 
 After this point both paths call the same monodromy routines. Torch is imported
 only by the autodiff path.

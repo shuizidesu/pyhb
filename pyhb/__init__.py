@@ -1,7 +1,7 @@
 """Generic pyHB harmonic-balance tools for nonlinear dynamics."""
 
 from .continuation import ContinuationConfig, ContinuationResult, ContinuationSolver
-from .floquet import FloquetConfig, FloquetResult, compute_floquet
+from .floquet import FloquetConfig, FloquetResult, compute_floquet, compute_free_frequency_floquet
 from .free_frequency import (
     FreeFrequencyContinuationConfig,
     FreeFrequencyContinuationResult,
@@ -27,6 +27,7 @@ _AUTODIFF_EXPORTS = {
     "ContinuationAutodiffSolver",
     "FreeFrequencyContinuationAutodiffConfig",
     "FreeFrequencyContinuationAutodiffSolver",
+    "compute_free_frequency_floquet_autodiff",
     "compute_floquet_autodiff",
 }
 
@@ -52,6 +53,7 @@ __all__ = [
     "SecondOrderTimeModel",
     "AutodiffFreeFrequencySecondOrderTimeModel",
     "build_full_fft_nonlinear_harmonics",
+    "compute_free_frequency_floquet",
     "compute_floquet",
 ]
 
@@ -59,7 +61,7 @@ __all__ = [
 def __getattr__(name: str):
     if name in _AUTODIFF_EXPORTS:
         from .continuation_autodiff import ContinuationAutodiffConfig, ContinuationAutodiffSolver
-        from .floquet_autodiff import compute_floquet_autodiff
+        from .floquet_autodiff import compute_floquet_autodiff, compute_free_frequency_floquet_autodiff
         from .free_frequency_autodiff import (
             FreeFrequencyContinuationAutodiffConfig,
             FreeFrequencyContinuationAutodiffSolver,
@@ -70,6 +72,7 @@ def __getattr__(name: str):
             "ContinuationAutodiffSolver": ContinuationAutodiffSolver,
             "FreeFrequencyContinuationAutodiffConfig": FreeFrequencyContinuationAutodiffConfig,
             "FreeFrequencyContinuationAutodiffSolver": FreeFrequencyContinuationAutodiffSolver,
+            "compute_free_frequency_floquet_autodiff": compute_free_frequency_floquet_autodiff,
             "compute_floquet_autodiff": compute_floquet_autodiff,
         }
         return values[name]

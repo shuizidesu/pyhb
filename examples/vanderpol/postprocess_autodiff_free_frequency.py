@@ -11,22 +11,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import FloquetConfig, compute_free_frequency_floquet
+from pyhb import FloquetConfig, compute_free_frequency_floquet_autodiff
 from pyhb.harmonics import generate_hb_items
-from examples.vanderpol.model import VanderpolModel
+from examples.vanderpol.autodiff_model import VanderpolAutodiffModel
 
 
-DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "free_frequency.npz"
-DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "free_frequency.png"
-DEFAULT_RMS_OUTPUT = Path(__file__).resolve().parent / "results" / "free_frequency_rms.npz"
-DEFAULT_STABILITY_OUTPUT = Path(__file__).resolve().parent / "results" / "free_frequency_floquet.npz"
+DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency.npz"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency.png"
+DEFAULT_RMS_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency_rms.npz"
+DEFAULT_STABILITY_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency_floquet.npz"
 DEFAULT_SAMPLE_COUNT = 2048
 HARMONICS = tuple(float(value) for value in range(1, 51))
 FREQUENCY_RESOLUTION = 1.0
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Postprocess the van der Pol free-frequency result.")
+    parser = argparse.ArgumentParser(description="Postprocess the van der Pol autodiff free-frequency result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hsu-samples", type=int, default=512)
     parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="trapezoid")
     parser.add_argument("--stability-tolerance", type=float, default=1e-4)
+    parser.add_argument("--torch-device", type=str, default=None)
     return parser.parse_args()
 
 
@@ -54,8 +55,9 @@ def compute_stability_history(
     hsu_samples: int,
     floquet_method: str,
     stability_tolerance: float,
+    torch_device: str | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.complex128]]:
-    model = VanderpolModel()
+    model = VanderpolAutodiffModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
         method=floquet_method,
@@ -70,7 +72,7 @@ def compute_stability_history(
         zip(parameter_history, omega_history, coefficient_history, strict=True),
         start=1,
     ):
-        result = compute_free_frequency_floquet(
+        result = compute_free_frequency_floquet_autodiff(
             model,
             coefficients,
             float(omega),
@@ -78,6 +80,7 @@ def compute_stability_history(
             HARMONICS,
             FREQUENCY_RESOLUTION,
             config,
+            torch_device=torch_device,
         )
         status = "stable" if result.stable else "unstable"
         print(
@@ -165,6 +168,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             getattr(args, "hsu_samples", 512),
             getattr(args, "floquet_method", "trapezoid"),
             getattr(args, "stability_tolerance", 1e-4),
+            getattr(args, "torch_device", None),
         )
     save_plot(parameter_history, omega_history, rms_history, args.output, stable_history)
     if args.rms_output is not None:
