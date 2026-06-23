@@ -9,7 +9,13 @@ import torch
 from numpy.typing import NDArray
 from torch.func import jacrev
 
-from .continuation_autodiff import _resolve_torch_device, _to_numpy
+from .autodiff_utils import (
+    _as_torch,
+    _resolve_torch_device,
+    _select_variable,
+    _to_numpy,
+    _validate_autodiff_variables,
+)
 from .floquet import (
     FloquetConfig,
     FloquetResult,
@@ -17,8 +23,7 @@ from .floquet import (
     prepare_solution_samples,
     sampled_jacobians_from_local_arrays,
 )
-from .models import AutodiffSecondOrderTimeModel, JacobianVariable
-from .models import AutodiffFreeFrequencySecondOrderTimeModel
+from .models import AutodiffFreeFrequencySecondOrderTimeModel, AutodiffSecondOrderTimeModel, JacobianVariable
 
 
 def compute_floquet_autodiff(
@@ -229,33 +234,3 @@ def _free_frequency_force_sum(
     if not isinstance(force, torch.Tensor):
         raise TypeError("local_residual_force_torch must return a torch.Tensor")
     return force.to(dtype=torch.float64, device=device).sum(dim=0)
-
-
-def _select_variable(
-    variable: JacobianVariable,
-    local_x: torch.Tensor,
-    local_dx: torch.Tensor,
-    local_ddx: torch.Tensor,
-) -> torch.Tensor:
-    if variable == "x":
-        return local_x
-    if variable == "dx":
-        return local_dx
-    if variable == "ddx":
-        return local_ddx
-    raise ValueError(f"unsupported autodiff variable {variable!r}")
-
-
-def _validate_autodiff_variables(variables: tuple[JacobianVariable, ...]) -> tuple[JacobianVariable, ...]:
-    normalized = tuple(variables)
-    allowed = {"x", "dx", "ddx"}
-    if len(set(normalized)) != len(normalized):
-        raise ValueError("autodiff_variables must not contain duplicates")
-    unsupported = set(normalized) - allowed
-    if unsupported:
-        raise ValueError(f"unsupported autodiff variable(s): {sorted(unsupported)}")
-    return normalized
-
-
-def _as_torch(values: NDArray[np.float64], device: torch.device) -> torch.Tensor:
-    return torch.as_tensor(np.asarray(values, dtype=np.float64), dtype=torch.float64, device=device)

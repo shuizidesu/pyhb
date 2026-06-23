@@ -9,7 +9,13 @@ import torch
 from numpy.typing import NDArray
 from torch.func import jacfwd, jacrev
 
-from .continuation_autodiff import _as_torch, _resolve_torch_device, _select_variable, _to_numpy, _validate_autodiff_variables
+from .autodiff_utils import (
+    _as_torch,
+    _resolve_torch_device,
+    _select_variable,
+    _to_numpy,
+    _validate_autodiff_variables,
+)
 from .free_frequency import FreeFrequencyContinuationConfig, FreeFrequencyContinuationSolver
 from .models import AutodiffFreeFrequencySecondOrderTimeModel, JacobianVariable, NonlinearJacobianTerm
 
@@ -185,7 +191,10 @@ class FreeFrequencyContinuationAutodiffSolver(FreeFrequencyContinuationSolver):
         else:
             omega_derivative = np.zeros(expected_force_shape, dtype=np.float64)
         if omega_derivative.shape != expected_force_shape:
-            raise ValueError(f"local residual omega derivative must have shape {expected_force_shape}, got {omega_derivative.shape}")
+            raise ValueError(
+                "local residual omega derivative must have shape "
+                f"{expected_force_shape}, got {omega_derivative.shape}"
+            )
 
         if self.model.autodiff_parameter_dependent:
             parameter_derivative = _to_numpy(
@@ -268,4 +277,3 @@ class FreeFrequencyContinuationAutodiffSolver(FreeFrequencyContinuationSolver):
             return self._call_torch_force(t, local_x, local_dx, local_ddx, omega, active_parameter)
 
         return jacfwd(force_for_parameter)(parameter)
-

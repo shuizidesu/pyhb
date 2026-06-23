@@ -19,6 +19,8 @@ examples/results/
 examples/*/results/
 examples/four_dof_fractional/
 examples/four_dof_integer/
+examples/*/data/initial_condition_*.npz
 
 tests/
 matlab_references/
+references/
