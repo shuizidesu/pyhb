@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -105,6 +106,115 @@ def assemble_hb_jacobian_from_terms(
     cols = np.concatenate(col_chunks)
     data = np.concatenate(data_chunks)
     return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
+
+
+def _coefficient_matrix(
+    coeff_line: NDArray[np.float64],
+    order: int,
+    n_dof: int,
+) -> NDArray[np.float64]:
+    return np.asarray(coeff_line, dtype=np.float64).reshape((order, n_dof), order="F")
+
+
+def _validated_dofs(name: str, dofs: Sequence[int], n_dof: int) -> tuple[int, ...]:
+    validated = tuple(int(dof) for dof in dofs)
+    if any(dof < 0 or dof >= n_dof for dof in validated):
+        raise ValueError(f"{name} contains out-of-range DOFs for n_dof={n_dof}: {validated}")
+    if len(set(validated)) != len(validated):
+        raise ValueError(f"{name} contains duplicate DOFs: {validated}")
+    return validated
+
+
+def _evaluate_local_state(
+    coefficients: NDArray[np.float64],
+    coordinate_dofs: Sequence[int],
+    hb_item: NDArray[np.float64],
+    hb_item_dt: NDArray[np.float64],
+    hb_item_ddt: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    coordinates = np.asarray(tuple(coordinate_dofs), dtype=np.int64)
+    local_coefficients = coefficients[:, coordinates]
+    return (
+        hb_item @ local_coefficients,
+        hb_item_dt @ local_coefficients,
+        hb_item_ddt @ local_coefficients,
+    )
+
+
+def _local_samples_to_global_coefficients(
+    local_samples: NDArray[np.float64],
+    force_dofs: Sequence[int],
+    context: HBContext,
+    sample_count: int,
+    n_dof: int,
+    label: str,
+) -> NDArray[np.float64]:
+    force_dofs = _validated_dofs("force_dofs", force_dofs, n_dof)
+    samples = np.asarray(local_samples, dtype=np.float64)
+    expected_shape = (sample_count, len(force_dofs))
+    if samples.shape != expected_shape:
+        raise ValueError(f"{label} must have shape {expected_shape}, got {samples.shape}")
+    local_coefficients = stack_fft_coefficients(
+        samples,
+        context.harmonics,
+        sample_count,
+        context.harmonic_indices,
+    ).reshape((context.order, len(force_dofs)), order="F")
+    return _scatter_local_coefficient_matrix(local_coefficients, force_dofs, context.order, n_dof)
+
+
+def _scatter_local_coefficient_matrix(
+    local_coefficients: NDArray[np.float64],
+    force_dofs: Sequence[int],
+    order: int,
+    n_dof: int,
+) -> NDArray[np.float64]:
+    force_dofs = _validated_dofs("force_dofs", force_dofs, n_dof)
+    coefficients = np.asarray(local_coefficients, dtype=np.float64)
+    expected_shape = (order, len(force_dofs))
+    if coefficients.shape != expected_shape:
+        raise ValueError(f"local coefficients must have shape {expected_shape}, got {coefficients.shape}")
+    full_coefficients = np.zeros((order, n_dof), dtype=np.float64)
+    full_coefficients[:, list(force_dofs)] = coefficients
+    return full_coefficients.reshape(-1, order="F")
+
+
+def _local_jacobian_terms_to_global(
+    local_terms: Sequence[object],
+    force_dofs: Sequence[int],
+    coordinate_dofs: Sequence[int],
+    sample_count: int,
+    n_dof: int,
+    label: str,
+) -> tuple[NonlinearJacobianTerm, ...]:
+    force_dofs = _validated_dofs("force_dofs", force_dofs, n_dof)
+    coordinate_dofs = _validated_dofs("coordinate_dofs", coordinate_dofs, n_dof)
+    global_terms: list[NonlinearJacobianTerm] = []
+    for term in local_terms:
+        variable = getattr(term, "variable")
+        if variable not in ("x", "dx", "ddx"):
+            raise ValueError(f"unsupported {label} Jacobian variable {variable!r}")
+        force_index = int(getattr(term, "force_index"))
+        coordinate_index = int(getattr(term, "coordinate_index"))
+        if not (0 <= force_index < len(force_dofs)):
+            raise ValueError(f"{label} force_index out of range: {force_index}")
+        if not (0 <= coordinate_index < len(coordinate_dofs)):
+            raise ValueError(f"{label} coordinate_index out of range: {coordinate_index}")
+        values = np.asarray(getattr(term, "values"), dtype=np.float64).reshape(-1)
+        if values.shape[0] != sample_count:
+            raise ValueError(
+                f"{label} Jacobian term values must have one value per time sample; "
+                f"got {values.shape[0]}, expected {sample_count}"
+            )
+        global_terms.append(
+            NonlinearJacobianTerm(
+                force_dofs[force_index],
+                variable,
+                coordinate_dofs[coordinate_index],
+                values,
+            )
+        )
+    return tuple(global_terms)
 
 
 def _validate_positive_scale(name: str, value: float) -> None:

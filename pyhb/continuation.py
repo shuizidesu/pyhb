@@ -14,18 +14,23 @@ from .continuation_core import (
     _PreparedProblem,
     _ResidualStats,
     _augmented_arc_matrix,
+    _coefficient_matrix,
     _combine_powered_dense_blocks,
     _combine_powered_sparse_blocks,
+    _evaluate_local_state,
+    _local_jacobian_terms_to_global,
+    _local_samples_to_global_coefficients,
     _parameter_step_too_large,
     _prepare_structured_parameter_blocks,
     _residual_stats,
     _shrink_arc_length_for_parameter_step,
     _solve_sparse,
+    _validated_dofs,
     _validate_optional_positive_scale,
     _validate_positive_scale,
     assemble_hb_jacobian_from_terms,
 )
-from .harmonics import flatten_coefficients, generate_hb_items, stack_fft_coefficients, unflatten_coefficients
+from .harmonics import flatten_coefficients, generate_hb_items
 from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics
 from .models import SecondOrderTimeModel
 
@@ -80,6 +85,13 @@ class ContinuationResult:
     period: float
     logs: list[StepLog] = field(default_factory=list)
     initial_log: StepLog | None = None
+
+
+@dataclass(frozen=True)
+class _NonlinearEvaluation:
+    coefficients: NDArray[np.float64]
+    jacobian: sparse.csc_matrix
+    parameter_coefficients: NDArray[np.float64] | None = None
 
 
 class ContinuationSolver:
@@ -137,15 +149,21 @@ class ContinuationSolver:
         if self.config.progress_callback is not None:
             self.config.progress_callback(message)
 
-    def _evaluate_state(
+    def _coefficient_matrix(self, coeff_line: NDArray[np.float64]) -> NDArray[np.float64]:
+        return _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
+
+    def _evaluate_local_state(
         self,
-        coeff_line: NDArray[np.float64],
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        coeff = unflatten_coefficients(coeff_line, self.prepared.context.order, self.model.n_dof)
-        x = self.prepared.hb_item @ coeff
-        dx = self.prepared.hb_item_dt @ coeff
-        ddx = self.prepared.hb_item_ddt @ coeff
-        return coeff, x, dx, ddx
+        coefficients: NDArray[np.float64],
+        coordinate_dofs: tuple[int, ...],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        return _evaluate_local_state(
+            coefficients,
+            coordinate_dofs,
+            self.prepared.hb_item,
+            self.prepared.hb_item_dt,
+            self.prepared.hb_item_ddt,
+        )
 
     def _linear_jacobian(self, parameter: float) -> sparse.csc_matrix:
         return _combine_powered_sparse_blocks(self.prepared.operator_blocks, parameter)
@@ -159,77 +177,108 @@ class ContinuationSolver:
     def _forcing_derivative_coefficients(self, parameter: float) -> NDArray[np.float64]:
         return _combine_powered_dense_blocks(self.prepared.forcing_blocks, parameter, derivative=True)
 
-    def _residual(
-        self,
-        coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        return self._residual_terms(coeff_line, x, dx, ddx, parameter)[0]
-
     def _residual_terms(
         self,
         coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        nonlinear: _NonlinearEvaluation,
         parameter: float,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        model = self.model
-        nonlinear_coefficients = stack_fft_coefficients(
-            model.nonlinear_force(self.prepared.t, x, dx, ddx, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
-        )
         forcing_coefficients = self._forcing_coefficients(parameter)
         linear_coefficients = self._linear_jacobian(parameter) @ coeff_line
-        residual = forcing_coefficients - nonlinear_coefficients - linear_coefficients
-        return residual, forcing_coefficients, nonlinear_coefficients, linear_coefficients
+        residual = forcing_coefficients - nonlinear.coefficients - linear_coefficients
+        return residual, forcing_coefficients, nonlinear.coefficients, linear_coefficients
 
     def _jacobian(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        nonlinear: _NonlinearEvaluation,
         parameter: float,
     ) -> sparse.csc_matrix:
-        return self._linear_jacobian(parameter) + self._nonlinear_jacobian(x, dx, ddx, parameter)
+        return self._linear_jacobian(parameter) + nonlinear.jacobian
 
-    def _nonlinear_jacobian(
+    def _evaluate_nonlinear(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        coefficients: NDArray[np.float64],
         parameter: float,
-    ) -> sparse.csc_matrix:
-        terms = tuple(self.model.nonlinear_jacobian_terms(self.prepared.t, x, dx, ddx, parameter))
-        return assemble_hb_jacobian_from_terms(
-            terms,
+        *,
+        include_parameter: bool,
+    ) -> _NonlinearEvaluation:
+        force_dofs = _validated_dofs("nonlinear_force_dofs", self.model.nonlinear_force_dofs, self.model.n_dof)
+        coordinate_dofs = _validated_dofs(
+            "nonlinear_coordinate_dofs",
+            self.model.nonlinear_coordinate_dofs,
+            self.model.n_dof,
+        )
+        local_x, local_dx, local_ddx = self._evaluate_local_state(coefficients, coordinate_dofs)
+
+        local_force = self.model.local_nonlinear_force(
+            self.prepared.t,
+            local_x,
+            local_dx,
+            local_ddx,
+            parameter,
+        )
+        nonlinear_coefficients = _local_samples_to_global_coefficients(
+            local_force,
+            force_dofs,
+            self.prepared.context,
+            self.prepared.t.size,
+            self.model.n_dof,
+            "local nonlinear force",
+        )
+
+        local_terms = tuple(
+            self.model.local_nonlinear_jacobian_terms(
+                self.prepared.t,
+                local_x,
+                local_dx,
+                local_ddx,
+                parameter,
+            )
+        )
+        global_terms = _local_jacobian_terms_to_global(
+            local_terms,
+            force_dofs,
+            coordinate_dofs,
+            self.prepared.t.size,
+            self.model.n_dof,
+            "local nonlinear",
+        )
+        nonlinear_jacobian = assemble_hb_jacobian_from_terms(
+            global_terms,
             self.prepared.context,
             self.prepared.t.size,
             self.model.n_dof,
         )
+        parameter_coefficients = None
+        if include_parameter:
+            local_parameter = self.model.local_nonlinear_parameter_derivative(
+                self.prepared.t,
+                local_x,
+                local_dx,
+                local_ddx,
+                parameter,
+            )
+            parameter_coefficients = _local_samples_to_global_coefficients(
+                local_parameter,
+                force_dofs,
+                self.prepared.context,
+                self.prepared.t.size,
+                self.model.n_dof,
+                "local nonlinear parameter derivative",
+            )
+        return _NonlinearEvaluation(nonlinear_coefficients, nonlinear_jacobian, parameter_coefficients)
 
     def _parameter_jacobian(
         self,
         coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        nonlinear: _NonlinearEvaluation,
         parameter: float,
     ) -> NDArray[np.float64]:
-        nonlinear_parameter = stack_fft_coefficients(
-            self.model.nonlinear_parameter_derivative(self.prepared.t, x, dx, ddx, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
-        )
+        if nonlinear.parameter_coefficients is None:
+            raise ValueError("nonlinear evaluation does not include parameter coefficients")
         parameter_column = (
             self._forcing_derivative_coefficients(parameter)
-            - nonlinear_parameter
+            - nonlinear.parameter_coefficients
             - self._linear_jacobian_derivative(parameter) @ coeff_line
         )
         return parameter_column.reshape(-1, 1)
@@ -238,13 +287,14 @@ class ContinuationSolver:
         self,
         coeff_line: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], StepLog]:
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], _NonlinearEvaluation, sparse.csc_matrix, StepLog]:
         config = self.config
         epoch = 1
         residual_vector = np.full(coeff_line.shape, np.inf, dtype=np.float64)
         residual_stats = _ResidualStats(np.inf, np.inf)
         delta = np.full(coeff_line.shape, np.inf, dtype=np.float64)
-        coeff = x = dx = ddx = None
+        coeff = None
+        nonlinear = None
         jacobian = None
 
         while (
@@ -252,17 +302,19 @@ class ContinuationSolver:
             and residual_stats.relative_residual >= config.res_tolerance
             and np.max(np.abs(delta)) >= config.delta_tolerance
         ):
-            coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-            jacobian = self._jacobian(x, dx, ddx, parameter)
-            residual_terms = self._residual_terms(coeff_line, x, dx, ddx, parameter)
+            coeff = self._coefficient_matrix(coeff_line)
+            nonlinear = self._evaluate_nonlinear(coeff, parameter, include_parameter=False)
+            jacobian = self._jacobian(nonlinear, parameter)
+            residual_terms = self._residual_terms(coeff_line, nonlinear, parameter)
             residual_vector = residual_terms[0]
             residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
             delta = _solve_sparse(jacobian, residual_vector)
             coeff_line = coeff_line + delta
             epoch += 1
 
-        coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-        jacobian = self._jacobian(x, dx, ddx, parameter)
+        coeff = self._coefficient_matrix(coeff_line)
+        nonlinear = self._evaluate_nonlinear(coeff, parameter, include_parameter=True)
+        jacobian = self._jacobian(nonlinear, parameter)
         log = StepLog(
             step=0,
             epoch=epoch,
@@ -276,7 +328,7 @@ class ContinuationSolver:
                 or np.max(np.abs(delta)) < config.delta_tolerance
             ),
         )
-        return coeff_line, coeff, x, dx, jacobian, log
+        return coeff_line, coeff, nonlinear, jacobian, log
 
     def _orient_initial_tangent(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
         oriented = np.asarray(tangent, dtype=np.float64)
@@ -337,15 +389,14 @@ class ContinuationSolver:
             )
 
         parameter = float(config.init_omega if initial_parameter is None else initial_parameter)
-        coeff_line, coeff, x, dx, jacobian, initial_log = self._solve_initial(coeff_line, parameter)
+        coeff_line, coeff, nonlinear, jacobian, initial_log = self._solve_initial(coeff_line, parameter)
         self._emit_progress(
             "Initial computation, "
             f"Epoch = {initial_log.epoch}, RelRes = {initial_log.relative_residual:.6e}, "
             f"MaxRes = {initial_log.max_residual:.6e}, "
             f"Delta = {initial_log.max_delta:.6e}, Omega = {initial_log.omega:.10g}"
         )
-        _, _, _, ddx = self._evaluate_state(coeff_line)
-        j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
+        j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter)
         tangent = self._initial_tangent(jacobian, j_parameter)
         y0 = np.concatenate((coeff_line, np.array([parameter], dtype=np.float64)))
 
@@ -371,12 +422,13 @@ class ContinuationSolver:
                     and residual_stats.relative_residual >= config.res_tolerance
                     and np.max(np.abs(delta)) >= config.delta_tolerance
                 ):
-                    coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-                    jacobian = self._jacobian(x, dx, ddx, parameter)
-                    residual_terms = self._residual_terms(coeff_line, x, dx, ddx, parameter)
+                    coeff = self._coefficient_matrix(coeff_line)
+                    nonlinear = self._evaluate_nonlinear(coeff, parameter, include_parameter=True)
+                    jacobian = self._jacobian(nonlinear, parameter)
+                    residual_terms = self._residual_terms(coeff_line, nonlinear, parameter)
                     residual_vector = residual_terms[0]
                     residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-                    j_parameter = self._parameter_jacobian(coeff_line, x, dx, ddx, parameter)
+                    j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter)
                     r_arc = np.concatenate(
                         (
                             residual_vector,
@@ -432,7 +484,7 @@ class ContinuationSolver:
                         np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0])))
                     )
                     tangent = self._weighted_normalize(tangent_candidate)
-                    coeff, _, _, _ = self._evaluate_state(coeff_line)
+                    coeff = self._coefficient_matrix(coeff_line)
                     parameter_history.append(float(parameter))
                     coefficient_history.append(coeff.copy())
                     shrink_count = 0
@@ -461,7 +513,7 @@ class ContinuationSolver:
             if shrink_count >= config.shrink_limit:
                 break
 
-        final_coeff, _, _, _ = self._evaluate_state(y0[:-1])
+        final_coeff = self._coefficient_matrix(y0[:-1])
         final_parameter = float(y0[-1])
         coefficient_history_array = (
             np.asarray(coefficient_history, dtype=np.float64)

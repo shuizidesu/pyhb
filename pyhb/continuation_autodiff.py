@@ -17,8 +17,9 @@ from .autodiff_utils import (
     _to_numpy,
     _validate_autodiff_variables,
 )
-from .continuation import ContinuationConfig, ContinuationSolver
-from .harmonics import coefficient_matrix_from_fft, stack_fft_coefficients
+from .continuation import _NonlinearEvaluation, ContinuationConfig, ContinuationSolver
+from .continuation_core import _local_samples_to_global_coefficients, _validated_dofs
+from .harmonics import coefficient_matrix_from_fft
 from .models import AutodiffSecondOrderTimeModel, JacobianVariable
 
 
@@ -29,9 +30,8 @@ class ContinuationAutodiffConfig(ContinuationConfig):
     torch_device: str | None = None
 
 
-@dataclass
-class _AutodiffCache:
-    key: tuple[int, int, int, float]
+@dataclass(frozen=True)
+class _AutodiffLocalEvaluation:
     force_samples: NDArray[np.float64]
     jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]]
     parameter_derivative: NDArray[np.float64]
@@ -47,45 +47,70 @@ class ContinuationAutodiffSolver(ContinuationSolver):
     ) -> None:
         if not isinstance(model, AutodiffSecondOrderTimeModel):
             raise TypeError("ContinuationAutodiffSolver requires an AutodiffSecondOrderTimeModel")
-        self._autodiff_cache: _AutodiffCache | None = None
         super().__init__(model, config or ContinuationAutodiffConfig())
         self.model: AutodiffSecondOrderTimeModel
         self.config: ContinuationAutodiffConfig
         self._torch_device = _resolve_torch_device(self.config.torch_device)
         self._autodiff_variables = _validate_autodiff_variables(self.model.autodiff_variables)
 
-    def _residual(
+    def _evaluate_nonlinear(
         self,
-        coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        coefficients: NDArray[np.float64],
         parameter: float,
-    ) -> NDArray[np.float64]:
-        nonlinear_coefficients = stack_fft_coefficients(
-            self._global_nonlinear_force_samples(x, dx, ddx, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
+        *,
+        include_parameter: bool,
+    ) -> _NonlinearEvaluation:
+        force_dofs = _validated_dofs("nonlinear_force_dofs", self.model.nonlinear_force_dofs, self.model.n_dof)
+        coordinate_dofs = _validated_dofs(
+            "nonlinear_coordinate_dofs",
+            self.model.nonlinear_coordinate_dofs,
+            self.model.n_dof,
         )
-        return (
-            self._forcing_coefficients(parameter)
-            - nonlinear_coefficients
-            - self._linear_jacobian(parameter) @ coeff_line
+        local_x, local_dx, local_ddx = self._evaluate_local_state(coefficients, coordinate_dofs)
+        local = self._autodiff_values(
+            local_x,
+            local_dx,
+            local_ddx,
+            parameter,
+            force_count=len(force_dofs),
+            coordinate_count=len(coordinate_dofs),
+            include_parameter=include_parameter,
         )
+        nonlinear_coefficients = _local_samples_to_global_coefficients(
+            local.force_samples,
+            force_dofs,
+            self.prepared.context,
+            self.prepared.t.size,
+            self.model.n_dof,
+            "local nonlinear force",
+        )
+        nonlinear_jacobian = self._nonlinear_jacobian_from_values(
+            local.jacobian_by_variable,
+            force_dofs,
+            coordinate_dofs,
+        )
+        parameter_coefficients = None
+        if include_parameter:
+            parameter_coefficients = _local_samples_to_global_coefficients(
+                local.parameter_derivative,
+                force_dofs,
+                self.prepared.context,
+                self.prepared.t.size,
+                self.model.n_dof,
+                "local nonlinear parameter derivative",
+            )
+        return _NonlinearEvaluation(nonlinear_coefficients, nonlinear_jacobian, parameter_coefficients)
 
-    def _nonlinear_jacobian(
+    def _nonlinear_jacobian_from_values(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
+        jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]],
+        force_dofs: tuple[int, ...],
+        coordinate_dofs: tuple[int, ...],
     ) -> sparse.csc_matrix:
         context = self.prepared.context
         order = context.order
         size = self.model.n_dof * order
-        cache = self._autodiff_values(x, dx, ddx, parameter)
-        if not cache.jacobian_by_variable:
+        if not jacobian_by_variable:
             return sparse.csc_matrix((size, size), dtype=np.float64)
 
         tensor_by_variable = {
@@ -93,12 +118,12 @@ class ContinuationAutodiffSolver(ContinuationSolver):
             "dx": context.s3_tensor_dx,
             "ddx": context.s3_tensor_ddx,
         }
-        force_dofs = np.asarray(self.model.nonlinear_force_dofs, dtype=np.int64)
-        coordinate_dofs = np.asarray(self.model.nonlinear_coordinate_dofs, dtype=np.int64)
-        force_count = force_dofs.size
-        coordinate_count = coordinate_dofs.size
-        force_columns = np.repeat(force_dofs, coordinate_count)
-        coordinate_columns = np.tile(coordinate_dofs, force_count)
+        force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
+        coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
+        force_count = force_dofs_array.size
+        coordinate_count = coordinate_dofs_array.size
+        force_columns = np.repeat(force_dofs_array, coordinate_count)
+        coordinate_columns = np.tile(coordinate_dofs_array, force_count)
         row_offsets = np.arange(order, dtype=np.int64)
         col_offsets = np.arange(order, dtype=np.int64)
 
@@ -106,7 +131,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
         col_chunks: list[NDArray[np.int64]] = []
         data_chunks: list[NDArray[np.float64]] = []
 
-        for variable, values in cache.jacobian_by_variable.items():
+        for variable, values in jacobian_by_variable.items():
             flat_values = values.reshape(values.shape[0], force_count * coordinate_count)
             coeffs = coefficient_matrix_from_fft(
                 flat_values,
@@ -127,79 +152,24 @@ class ContinuationAutodiffSolver(ContinuationSolver):
         data = np.concatenate(data_chunks)
         return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
 
-    def _parameter_jacobian(
-        self,
-        coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        nonlinear_parameter = stack_fft_coefficients(
-            self._global_nonlinear_parameter_derivative(x, dx, ddx, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
-        )
-        parameter_column = (
-            self._forcing_derivative_coefficients(parameter)
-            - nonlinear_parameter
-            - self._linear_jacobian_derivative(parameter) @ coeff_line
-        )
-        return parameter_column.reshape(-1, 1)
-
-    def _global_nonlinear_force_samples(
-        self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        force = np.zeros((self.prepared.t.size, self.model.n_dof), dtype=np.float64)
-        force[:, list(self.model.nonlinear_force_dofs)] = self._autodiff_values(
-            x,
-            dx,
-            ddx,
-            parameter,
-        ).force_samples
-        return force
-
-    def _global_nonlinear_parameter_derivative(
-        self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        derivative = np.zeros((self.prepared.t.size, self.model.n_dof), dtype=np.float64)
-        derivative[:, list(self.model.nonlinear_force_dofs)] = self._autodiff_values(
-            x,
-            dx,
-            ddx,
-            parameter,
-        ).parameter_derivative
-        return derivative
-
     def _autodiff_values(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        local_x: NDArray[np.float64],
+        local_dx: NDArray[np.float64],
+        local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> _AutodiffCache:
-        key = (id(x), id(dx), id(ddx), float(parameter))
-        if self._autodiff_cache is not None and self._autodiff_cache.key == key:
-            return self._autodiff_cache
-
-        force_dofs = tuple(self.model.nonlinear_force_dofs)
-        coordinate_dofs = tuple(self.model.nonlinear_coordinate_dofs)
-        expected_force_shape = (self.prepared.t.size, len(force_dofs))
-        expected_coordinate_shape = (self.prepared.t.size, len(coordinate_dofs))
+        *,
+        force_count: int,
+        coordinate_count: int,
+        include_parameter: bool,
+    ) -> _AutodiffLocalEvaluation:
+        expected_force_shape = (self.prepared.t.size, force_count)
+        expected_coordinate_shape = (self.prepared.t.size, coordinate_count)
 
         t_tensor = _as_torch(self.prepared.t, self._torch_device)
-        x_tensor = _as_torch(x[:, list(coordinate_dofs)], self._torch_device)
-        dx_tensor = _as_torch(dx[:, list(coordinate_dofs)], self._torch_device)
-        ddx_tensor = _as_torch(ddx[:, list(coordinate_dofs)], self._torch_device)
+        x_tensor = _as_torch(local_x, self._torch_device)
+        dx_tensor = _as_torch(local_dx, self._torch_device)
+        ddx_tensor = _as_torch(local_ddx, self._torch_device)
         parameter_tensor = torch.as_tensor(float(parameter), dtype=torch.float64, device=self._torch_device)
 
         if x_tensor.shape != expected_coordinate_shape:
@@ -221,14 +191,14 @@ class ContinuationAutodiffSolver(ContinuationSolver):
                 parameter_tensor,
             )
             jacobian = _to_numpy(jacobian_tensor)
-            expected_jacobian_shape = (self.prepared.t.size, len(force_dofs), len(coordinate_dofs))
+            expected_jacobian_shape = (self.prepared.t.size, force_count, coordinate_count)
             if jacobian.shape != expected_jacobian_shape:
                 raise ValueError(
                     f"dN/d{variable} must have shape {expected_jacobian_shape}, got {jacobian.shape}"
                 )
             jacobian_by_variable[variable] = jacobian
 
-        if self.model.autodiff_parameter_dependent:
+        if include_parameter and self.model.autodiff_parameter_dependent:
             parameter_derivative = _to_numpy(
                 self._differentiate_parameter(t_tensor, x_tensor, dx_tensor, ddx_tensor, parameter_tensor)
             )
@@ -239,14 +209,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
                 "local nonlinear parameter derivative must have shape "
                 f"{expected_force_shape}, got {parameter_derivative.shape}"
             )
-
-        self._autodiff_cache = _AutodiffCache(
-            key,
-            force_samples,
-            jacobian_by_variable,
-            parameter_derivative,
-        )
-        return self._autodiff_cache
+        return _AutodiffLocalEvaluation(force_samples, jacobian_by_variable, parameter_derivative)
 
     def _call_torch_force(
         self,

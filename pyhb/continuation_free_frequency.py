@@ -12,15 +12,20 @@ from scipy.sparse.linalg import splu
 
 from .continuation import ContinuationConfig, ContinuationSolver
 from .continuation_core import (
+    _coefficient_matrix,
+    _evaluate_local_state,
+    _local_jacobian_terms_to_global,
+    _local_samples_to_global_coefficients,
     _parameter_step_too_large,
     _residual_stats,
     _shrink_arc_length_for_parameter_step,
     _solve_sparse,
+    _validated_dofs,
     _validate_optional_positive_scale,
     _validate_positive_scale,
     assemble_hb_jacobian_from_terms,
 )
-from .harmonics import flatten_coefficients, stack_fft_coefficients
+from .harmonics import flatten_coefficients
 from .models import FreeFrequencySecondOrderTimeModel, HarmonicCoefficientConstraint
 
 
@@ -67,6 +72,14 @@ class ContinuationFreeFrequencyResult:
     initial_log: ContinuationFreeFrequencyStepLog | None = None
 
 
+@dataclass(frozen=True)
+class _GeneralizedEvaluation:
+    coefficients: NDArray[np.float64]
+    jacobian: sparse.csc_matrix
+    omega_coefficients: NDArray[np.float64]
+    parameter_coefficients: NDArray[np.float64] | None = None
+
+
 class ContinuationFreeFrequencySolver(ContinuationSolver):
     """Arc-length continuation with unknown response frequency and one true parameter."""
 
@@ -92,125 +105,145 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
     def _residual_terms(
         self,
         coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        generalized_coefficients = stack_fft_coefficients(
-            self._generalized_force_samples(x, dx, ddx, omega, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
-        )
         forcing_coefficients = self._forcing_coefficients(omega)
         linear_coefficients = self._linear_jacobian(omega) @ coeff_line
-        residual = forcing_coefficients - generalized_coefficients - linear_coefficients
-        return residual, forcing_coefficients, generalized_coefficients, linear_coefficients
+        residual = forcing_coefficients - generalized.coefficients - linear_coefficients
+        return residual, forcing_coefficients, generalized.coefficients, linear_coefficients
 
     def _jacobian(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
     ) -> sparse.csc_matrix:
-        return self._linear_jacobian(omega) + self._generalized_jacobian(x, dx, ddx, omega, parameter)
+        return self._linear_jacobian(omega) + generalized.jacobian
 
-    def _generalized_jacobian(
+    def _evaluate_generalized(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        coefficients: NDArray[np.float64],
         omega: float,
         parameter: float,
-    ) -> sparse.csc_matrix:
-        terms = tuple(self._generalized_jacobian_terms(x, dx, ddx, omega, parameter))
-        return assemble_hb_jacobian_from_terms(
-            terms,
+        *,
+        include_parameter: bool,
+    ) -> _GeneralizedEvaluation:
+        force_dofs = _validated_dofs("residual_force_dofs", self.model.residual_force_dofs, self.model.n_dof)
+        coordinate_dofs = _validated_dofs(
+            "residual_coordinate_dofs",
+            self.model.residual_coordinate_dofs,
+            self.model.n_dof,
+        )
+        local_x, local_dx, local_ddx = _evaluate_local_state(
+            coefficients,
+            coordinate_dofs,
+            self.prepared.hb_item,
+            self.prepared.hb_item_dt,
+            self.prepared.hb_item_ddt,
+        )
+        local_force = self.model.local_residual_force(
+            self.prepared.t,
+            local_x,
+            local_dx,
+            local_ddx,
+            omega,
+            parameter,
+        )
+        generalized_coefficients = _local_samples_to_global_coefficients(
+            local_force,
+            force_dofs,
             self.prepared.context,
             self.prepared.t.size,
             self.model.n_dof,
+            "local residual force",
+        )
+        local_terms = tuple(
+            self.model.local_residual_jacobian_terms(
+                self.prepared.t,
+                local_x,
+                local_dx,
+                local_ddx,
+                omega,
+                parameter,
+            )
+        )
+        global_terms = _local_jacobian_terms_to_global(
+            local_terms,
+            force_dofs,
+            coordinate_dofs,
+            self.prepared.t.size,
+            self.model.n_dof,
+            "local residual",
+        )
+        generalized_jacobian = assemble_hb_jacobian_from_terms(
+            global_terms,
+            self.prepared.context,
+            self.prepared.t.size,
+            self.model.n_dof,
+        )
+        local_omega = self.model.local_residual_omega_derivative(
+            self.prepared.t,
+            local_x,
+            local_dx,
+            local_ddx,
+            omega,
+            parameter,
+        )
+        omega_coefficients = _local_samples_to_global_coefficients(
+            local_omega,
+            force_dofs,
+            self.prepared.context,
+            self.prepared.t.size,
+            self.model.n_dof,
+            "local residual omega derivative",
+        )
+        parameter_coefficients = None
+        if include_parameter:
+            local_parameter = self.model.local_residual_parameter_derivative(
+                self.prepared.t,
+                local_x,
+                local_dx,
+                local_ddx,
+                omega,
+                parameter,
+            )
+            parameter_coefficients = _local_samples_to_global_coefficients(
+                local_parameter,
+                force_dofs,
+                self.prepared.context,
+                self.prepared.t.size,
+                self.model.n_dof,
+                "local residual parameter derivative",
+            )
+        return _GeneralizedEvaluation(
+            generalized_coefficients,
+            generalized_jacobian,
+            omega_coefficients,
+            parameter_coefficients,
         )
 
     def _omega_column(
         self,
         coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
     ) -> NDArray[np.float64]:
-        generalized_omega = stack_fft_coefficients(
-            self._generalized_omega_derivative_samples(x, dx, ddx, omega, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
-        )
         return (
             self._forcing_derivative_coefficients(omega)
-            - generalized_omega
+            - generalized.omega_coefficients
             - self._linear_jacobian_derivative(omega) @ coeff_line
         )
 
     def _parameter_column(
         self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        omega: float,
-        parameter: float,
+        generalized: _GeneralizedEvaluation,
     ) -> NDArray[np.float64]:
-        generalized_parameter = stack_fft_coefficients(
-            self._generalized_parameter_derivative_samples(x, dx, ddx, omega, parameter),
-            self.prepared.context.harmonics,
-            self.config.sample_fft,
-            self.prepared.context.harmonic_indices,
-        )
-        return -generalized_parameter
-
-    def _generalized_force_samples(
-        self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        omega: float,
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        return self.model.residual_force(self.prepared.t, x, dx, ddx, omega, parameter)
-
-    def _generalized_jacobian_terms(
-        self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        omega: float,
-        parameter: float,
-    ):
-        return self.model.residual_jacobian_terms(self.prepared.t, x, dx, ddx, omega, parameter)
-
-    def _generalized_omega_derivative_samples(
-        self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        omega: float,
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        return self.model.residual_omega_derivative(self.prepared.t, x, dx, ddx, omega, parameter)
-
-    def _generalized_parameter_derivative_samples(
-        self,
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        omega: float,
-        parameter: float,
-    ) -> NDArray[np.float64]:
-        return self.model.residual_parameter_derivative(self.prepared.t, x, dx, ddx, omega, parameter)
+        if generalized.parameter_coefficients is None:
+            raise ValueError("generalized evaluation does not include parameter coefficients")
+        return -generalized.parameter_coefficients
 
     def _constraint_residual(self, coeff_line: NDArray[np.float64]) -> float:
         return float(coeff_line[self._constraint_index] - self.config.constraint.value)
@@ -268,14 +301,22 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         coeff_line: NDArray[np.float64],
         omega: float,
         parameter: float,
-    ) -> tuple[NDArray[np.float64], float, NDArray[np.float64], NDArray[np.float64], sparse.csc_matrix, ContinuationFreeFrequencyStepLog]:
+    ) -> tuple[
+        NDArray[np.float64],
+        float,
+        NDArray[np.float64],
+        _GeneralizedEvaluation,
+        sparse.csc_matrix,
+        ContinuationFreeFrequencyStepLog,
+    ]:
         config = self.config
         epoch = 1
         residual_vector = np.full(coeff_line.shape, np.inf, dtype=np.float64)
         residual_stats = _residual_stats(residual_vector, (), config.residual_floor)
         constraint_residual = np.inf
         delta = np.full(coeff_line.size + 1, np.inf, dtype=np.float64)
-        coeff = x = dx = ddx = None
+        coeff = None
+        generalized = None
         jacobian = None
 
         while (
@@ -289,12 +330,13 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                 config.delta_tolerance,
             )
         ):
-            coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-            jacobian = self._jacobian(x, dx, ddx, omega, parameter)
-            residual_terms = self._residual_terms(coeff_line, x, dx, ddx, omega, parameter)
+            coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
+            generalized = self._evaluate_generalized(coeff, omega, parameter, include_parameter=False)
+            jacobian = self._jacobian(generalized, omega, parameter)
+            residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
             residual_vector = residual_terms[0]
             residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-            omega_column = self._omega_column(coeff_line, x, dx, ddx, omega, parameter)
+            omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
             constraint_residual = self._constraint_residual(coeff_line)
             initial_matrix = self._initial_matrix(jacobian, omega_column)
             rhs = np.concatenate((residual_vector, np.array([-constraint_residual], dtype=np.float64)))
@@ -303,9 +345,10 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             omega = float(omega + delta[-1])
             epoch += 1
 
-        coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-        jacobian = self._jacobian(x, dx, ddx, omega, parameter)
-        residual_terms = self._residual_terms(coeff_line, x, dx, ddx, omega, parameter)
+        coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
+        generalized = self._evaluate_generalized(coeff, omega, parameter, include_parameter=True)
+        jacobian = self._jacobian(generalized, omega, parameter)
+        residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
         residual_vector = residual_terms[0]
         residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
         constraint_residual = self._constraint_residual(coeff_line)
@@ -329,7 +372,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                 config.delta_tolerance,
             ),
         )
-        return coeff_line, float(omega), coeff, x, jacobian, log
+        return coeff_line, float(omega), coeff, generalized, jacobian, log
 
     def _arc_weights(self, size: int) -> NDArray[np.float64]:
         return np.concatenate(
@@ -354,15 +397,13 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
     def _initial_tangent_free(
         self,
         coeff_line: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
+        generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
         jacobian: sparse.csc_matrix,
     ) -> NDArray[np.float64]:
-        omega_column = self._omega_column(coeff_line, x, dx, ddx, omega, parameter)
-        parameter_column = self._parameter_column(x, dx, ddx, omega, parameter)
+        omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
+        parameter_column = self._parameter_column(generalized)
         tangent_matrix = self._initial_matrix(jacobian, omega_column)
         rhs = np.concatenate((parameter_column, np.array([0.0], dtype=np.float64)))
         tangent_q_omega = _solve_sparse(tangent_matrix, rhs)
@@ -384,7 +425,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         omega = float(config.init_omega if initial_omega is None else initial_omega)
         parameter = float(config.init_parameter if initial_parameter is None else initial_parameter)
 
-        coeff_line, omega, coeff, x, jacobian, initial_log = self._solve_initial_free(
+        coeff_line, omega, coeff, generalized, jacobian, initial_log = self._solve_initial_free(
             coeff_line,
             omega,
             parameter,
@@ -397,8 +438,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             f"Parameter = {initial_log.parameter:.10g}"
         )
 
-        _, _, dx, ddx = self._evaluate_state(coeff_line)
-        tangent = self._initial_tangent_free(coeff_line, x, dx, ddx, omega, parameter, jacobian)
+        tangent = self._initial_tangent_free(coeff_line, generalized, omega, parameter, jacobian)
         y0 = np.concatenate((coeff_line, np.array([omega, parameter], dtype=np.float64)))
 
         omega_history: list[float] = [float(omega)] if initial_log.converged else []
@@ -432,13 +472,14 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                         config.delta_tolerance,
                     )
                 ):
-                    coeff, x, dx, ddx = self._evaluate_state(coeff_line)
-                    jacobian = self._jacobian(x, dx, ddx, omega, parameter)
-                    residual_terms = self._residual_terms(coeff_line, x, dx, ddx, omega, parameter)
+                    coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
+                    generalized = self._evaluate_generalized(coeff, omega, parameter, include_parameter=True)
+                    jacobian = self._jacobian(generalized, omega, parameter)
+                    residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
                     residual_vector = residual_terms[0]
                     residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-                    omega_column = self._omega_column(coeff_line, x, dx, ddx, omega, parameter)
-                    parameter_column = self._parameter_column(x, dx, ddx, omega, parameter)
+                    omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
+                    parameter_column = self._parameter_column(generalized)
                     constraint_residual = self._constraint_residual(coeff_line)
                     r_arc = np.concatenate(
                         (
@@ -514,7 +555,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                         np.concatenate((np.zeros(jacobian.shape[0] + 1), np.array([1.0], dtype=np.float64)))
                     )
                     tangent = self._weighted_normalize(tangent_candidate)
-                    coeff, _, _, _ = self._evaluate_state(coeff_line)
+                    coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
                     omega_history.append(float(omega))
                     parameter_history.append(float(parameter))
                     coefficient_history.append(coeff.copy())
@@ -544,7 +585,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             if shrink_count >= config.shrink_limit:
                 break
 
-        final_coeff, _, _, _ = self._evaluate_state(y0[:-2])
+        final_coeff = _coefficient_matrix(y0[:-2], self.prepared.context.order, self.model.n_dof)
         coefficient_history_array = (
             np.asarray(coefficient_history, dtype=np.float64)
             if coefficient_history
