@@ -65,7 +65,7 @@ def build_config(args: argparse.Namespace) -> ContinuationFreeFrequencyAutodiffC
         parameter_scale=PARAMETER_SCALE,
         max_parameter_step=MAX_PARAMETER_STEP,
         max_steps=args.max_steps,
-        constraint=HarmonicCoefficientConstraint(dof=0, coefficient_index=1, value=0.0),
+        initial_constraint=HarmonicCoefficientConstraint(dof=0, coefficient_index=1, value=0.0),
         torch_device=args.torch_device,
         progress_callback=print,
     )

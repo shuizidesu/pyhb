@@ -25,8 +25,9 @@ from .continuation_core import (
     _validate_positive_scale,
     assemble_hb_jacobian_from_terms,
 )
+from .hb_operators import coefficient_derivative_maps
 from .harmonics import flatten_coefficients
-from .models import FreeFrequencySecondOrderTimeModel, HarmonicCoefficientConstraint
+from .models import FreeFrequencySecondOrderTimeModel, HarmonicCoefficientConstraint, ReferencePhaseCondition
 
 
 @dataclass(frozen=True)
@@ -35,11 +36,21 @@ class ContinuationFreeFrequencyConfig(ContinuationConfig):
 
     init_parameter: float = 0.5
     parameter_scale: float = 1.0
-    constraint: HarmonicCoefficientConstraint = field(
+    initial_constraint: HarmonicCoefficientConstraint = field(
         default_factory=lambda: HarmonicCoefficientConstraint(dof=0, coefficient_index=1, value=0.0)
     )
+    phase_condition: HarmonicCoefficientConstraint | ReferencePhaseCondition = field(
+        default_factory=ReferencePhaseCondition
+    )
+    constraint: HarmonicCoefficientConstraint | None = field(default=None, repr=False, compare=False)
     constraint_tolerance: float = 1e-10
     progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.constraint is not None:
+            object.__setattr__(self, "initial_constraint", self.constraint)
+            if isinstance(self.phase_condition, ReferencePhaseCondition):
+                object.__setattr__(self, "phase_condition", self.constraint)
 
 
 @dataclass(frozen=True)
@@ -96,11 +107,22 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         _validate_positive_scale("parameter_scale", self.config.parameter_scale)
         _validate_positive_scale("constraint_tolerance", self.config.constraint_tolerance)
         _validate_optional_positive_scale("max_parameter_step", self.config.max_parameter_step)
-        self._constraint_index = _constraint_flat_index(
-            self.config.constraint,
+        self._initial_constraint_index = _constraint_flat_index(
+            self.config.initial_constraint,
             self.prepared.context.order,
             self.model.n_dof,
         )
+        if isinstance(self.config.phase_condition, HarmonicCoefficientConstraint):
+            self._phase_constraint_index = _constraint_flat_index(
+                self.config.phase_condition,
+                self.prepared.context.order,
+                self.model.n_dof,
+            )
+        elif isinstance(self.config.phase_condition, ReferencePhaseCondition):
+            self._phase_constraint_index = None
+        else:
+            raise TypeError("phase_condition must be HarmonicCoefficientConstraint or ReferencePhaseCondition")
+        self._coefficient_dt_map = coefficient_derivative_maps(self.prepared.context.harmonics)[0]
 
     def _residual_terms(
         self,
@@ -245,25 +267,66 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             raise ValueError("generalized evaluation does not include parameter coefficients")
         return -generalized.parameter_coefficients
 
-    def _constraint_residual(self, coeff_line: NDArray[np.float64]) -> float:
-        return float(coeff_line[self._constraint_index] - self.config.constraint.value)
+    def _fixed_constraint_residual(
+        self,
+        coeff_line: NDArray[np.float64],
+        constraint: HarmonicCoefficientConstraint,
+        constraint_index: int,
+    ) -> float:
+        return float(coeff_line[constraint_index] - constraint.value)
 
-    def _constraint_row(self, width: int) -> sparse.csr_matrix:
+    def _fixed_constraint_row(self, width: int, constraint_index: int) -> sparse.csr_matrix:
         return sparse.csr_matrix(
             (
                 np.array([1.0], dtype=np.float64),
                 (
                     np.array([0], dtype=np.int64),
-                    np.array([self._constraint_index], dtype=np.int64),
+                    np.array([constraint_index], dtype=np.int64),
                 ),
             ),
             shape=(1, width),
         )
 
+    def _phase_constraint_row_vector(self, phase_reference: NDArray[np.float64]) -> NDArray[np.float64]:
+        if isinstance(self.config.phase_condition, HarmonicCoefficientConstraint):
+            row = np.zeros(phase_reference.shape, dtype=np.float64)
+            if self._phase_constraint_index is None:
+                raise RuntimeError("fixed phase constraint index was not initialized")
+            row[self._phase_constraint_index] = 1.0
+            return row
+        return _reference_phase_row(
+            phase_reference,
+            self._coefficient_dt_map,
+            self.prepared.context.order,
+            self.model.n_dof,
+        )
+
+    def _phase_constraint_residual(
+        self,
+        coeff_line: NDArray[np.float64],
+        phase_reference: NDArray[np.float64],
+    ) -> float:
+        if isinstance(self.config.phase_condition, HarmonicCoefficientConstraint):
+            if self._phase_constraint_index is None:
+                raise RuntimeError("fixed phase constraint index was not initialized")
+            return self._fixed_constraint_residual(
+                coeff_line,
+                self.config.phase_condition,
+                self._phase_constraint_index,
+            )
+        return float(self._phase_constraint_row_vector(phase_reference) @ coeff_line)
+
+    def _phase_constraint_row(self, width: int, phase_reference: NDArray[np.float64]) -> sparse.csr_matrix:
+        row = self._phase_constraint_row_vector(phase_reference)
+        if row.size != width:
+            raise ValueError(f"phase reference width mismatch: expected {width}, got {row.size}")
+        return sparse.csr_matrix(row.reshape(1, width))
+
     def _initial_matrix(
         self,
         jacobian: sparse.spmatrix,
         omega_column: NDArray[np.float64],
+        constraint_row: sparse.spmatrix,
     ) -> sparse.csc_matrix:
         size = jacobian.shape[0]
         top = sparse.hstack(
@@ -273,7 +336,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             ),
             format="csc",
         )
-        constraint = sparse.hstack((self._constraint_row(size), sparse.csr_matrix((1, 1))), format="csr")
+        constraint = sparse.hstack((constraint_row, sparse.csr_matrix((1, 1))), format="csr")
         return sparse.vstack((top, constraint), format="csc")
 
     def _arc_matrix(
@@ -281,6 +344,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         jacobian: sparse.spmatrix,
         omega_column: NDArray[np.float64],
         parameter_column: NDArray[np.float64],
+        constraint_row: sparse.spmatrix,
         arc_row: NDArray[np.float64],
     ) -> sparse.csc_matrix:
         size = jacobian.shape[0]
@@ -292,7 +356,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             ),
             format="csc",
         )
-        constraint = sparse.hstack((self._constraint_row(size), sparse.csr_matrix((1, 2))), format="csr")
+        constraint = sparse.hstack((constraint_row, sparse.csr_matrix((1, 2))), format="csr")
         arc_sparse = sparse.csr_matrix(np.asarray(arc_row, dtype=np.float64).reshape(1, size + 2))
         return sparse.vstack((top, constraint, arc_sparse), format="csc")
 
@@ -337,8 +401,13 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             residual_vector = residual_terms[0]
             residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
             omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
-            constraint_residual = self._constraint_residual(coeff_line)
-            initial_matrix = self._initial_matrix(jacobian, omega_column)
+            constraint_residual = self._fixed_constraint_residual(
+                coeff_line,
+                config.initial_constraint,
+                self._initial_constraint_index,
+            )
+            initial_constraint_row = self._fixed_constraint_row(jacobian.shape[0], self._initial_constraint_index)
+            initial_matrix = self._initial_matrix(jacobian, omega_column, initial_constraint_row)
             rhs = np.concatenate((residual_vector, np.array([-constraint_residual], dtype=np.float64)))
             delta = _solve_sparse(initial_matrix, rhs)
             coeff_line = coeff_line + delta[:-1]
@@ -351,7 +420,11 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
         residual_vector = residual_terms[0]
         residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-        constraint_residual = self._constraint_residual(coeff_line)
+        constraint_residual = self._fixed_constraint_residual(
+            coeff_line,
+            config.initial_constraint,
+            self._initial_constraint_index,
+        )
         max_delta = float(np.max(np.abs(delta)))
         log = ContinuationFreeFrequencyStepLog(
             step=0,
@@ -404,7 +477,8 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
     ) -> NDArray[np.float64]:
         omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
         parameter_column = self._parameter_column(generalized)
-        tangent_matrix = self._initial_matrix(jacobian, omega_column)
+        phase_row = self._phase_constraint_row(jacobian.shape[0], coeff_line)
+        tangent_matrix = self._initial_matrix(jacobian, omega_column, phase_row)
         rhs = np.concatenate((parameter_column, np.array([0.0], dtype=np.float64)))
         tangent_q_omega = _solve_sparse(tangent_matrix, rhs)
         return self._orient_initial_tangent(
@@ -452,6 +526,8 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             while True:
                 epoch = 1
                 y = y0 + arc_length_step * tangent
+                phase_reference = y0[:-2].copy()
+                phase_row = self._phase_constraint_row(self.model.n_dof * order, phase_reference)
                 coeff_line = y[:-2].copy()
                 omega = float(y[-2])
                 parameter = float(y[-1])
@@ -480,7 +556,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                     residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
                     omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
                     parameter_column = self._parameter_column(generalized)
-                    constraint_residual = self._constraint_residual(coeff_line)
+                    constraint_residual = self._phase_constraint_residual(coeff_line, phase_reference)
                     r_arc = np.concatenate(
                         (
                             residual_vector,
@@ -497,6 +573,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                         jacobian,
                         omega_column,
                         parameter_column,
+                        phase_row,
                         self._weighted_constraint_row(tangent),
                     )
                     j_arc_lu = splu(j_arc_v)
@@ -551,7 +628,16 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                     y0 = y.copy()
                     if j_arc_lu is None:
                         raise RuntimeError("converged before assembling free-frequency arc Jacobian")
-                    tangent_candidate = j_arc_lu.solve(
+                    next_phase_row = self._phase_constraint_row(jacobian.shape[0], coeff_line)
+                    tangent_matrix = self._arc_matrix(
+                        jacobian,
+                        omega_column,
+                        parameter_column,
+                        next_phase_row,
+                        self._weighted_constraint_row(tangent),
+                    )
+                    tangent_candidate = _solve_sparse(
+                        tangent_matrix,
                         np.concatenate((np.zeros(jacobian.shape[0] + 1), np.array([1.0], dtype=np.float64)))
                     )
                     tangent = self._weighted_normalize(tangent_candidate)
@@ -615,6 +701,22 @@ def _constraint_flat_index(constraint: HarmonicCoefficientConstraint, order: int
     if not (0 <= coefficient_index < order):
         raise ValueError(f"constraint coefficient_index out of range: {coefficient_index}")
     return dof * order + coefficient_index
+
+
+def _reference_phase_row(
+    phase_reference: NDArray[np.float64],
+    coefficient_dt_map: NDArray[np.float64],
+    order: int,
+    n_dof: int,
+) -> NDArray[np.float64]:
+    reference = np.asarray(phase_reference, dtype=np.float64).reshape((order, n_dof), order="F")
+    if coefficient_dt_map.shape != (order, order):
+        raise ValueError(f"coefficient_dt_map must have shape {(order, order)}, got {coefficient_dt_map.shape}")
+    row = (coefficient_dt_map @ reference).reshape(-1, order="F")
+    row_norm = float(np.linalg.norm(row))
+    if row_norm == 0.0:
+        raise ValueError("reference phase condition requires a nonzero time-varying reference state")
+    return row / row_norm
 
 
 def _as_coefficient_vector(values: NDArray[np.float64], order: int, n_dof: int) -> NDArray[np.float64]:

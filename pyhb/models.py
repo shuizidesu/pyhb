@@ -89,6 +89,17 @@ class HarmonicCoefficientConstraint:
     value: float = 0.0
 
 
+@dataclass(frozen=True)
+class ReferencePhaseCondition:
+    """Use an AUTO-style reference phase condition for free-frequency continuation.
+
+    This marker has no user parameters. After the initial fixed-coefficient
+    solve, the solver builds the phase row from the previous accepted HB
+    coefficients and the harmonic derivative map, then enforces
+    ``g(q) = q_ref^T D q = 0`` to remove time-shift ambiguity.
+    """
+
+
 class SecondOrderTimeModel(ABC):
     """Interface for second-order systems solved by harmonic balance.
 

@@ -19,6 +19,7 @@ from .models import (
     LocalNonlinearJacobianTerm,
     LocalResidualJacobianTerm,
     NonlinearJacobianTerm,
+    ReferencePhaseCondition,
     SecondOrderTimeModel,
 )
 
@@ -50,6 +51,7 @@ __all__ = [
     "LocalResidualJacobianTerm",
     "NonlinearJacobianTerm",
     "HarmonicCoefficientConstraint",
+    "ReferencePhaseCondition",
     "SecondOrderTimeModel",
     "AutodiffFreeFrequencySecondOrderTimeModel",
     "build_full_fft_nonlinear_harmonics",
