@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-stability", action="store_true")
     parser.add_argument("--stability-output", type=Path, default=DEFAULT_OUTPUT_FLOQUET)
     parser.add_argument("--hsu-samples", type=int, default=512)
-    parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="trapezoid")
+    parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="exponential")
     parser.add_argument("--stability-tolerance", type=float, default=1e-4)
     parser.add_argument("--torch-device", type=str, default=None)
     return parser.parse_args()

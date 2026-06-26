@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import FreeFrequencyContinuationConfig, FreeFrequencyContinuationResult, FreeFrequencyContinuationSolver, HarmonicCoefficientConstraint
+from pyhb import ContinuationFreeFrequencyConfig, ContinuationFreeFrequencyResult, ContinuationFreeFrequencySolver, HarmonicCoefficientConstraint
 from examples.vanderpol.model import VanderpolModel
 
 
@@ -40,8 +40,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> FreeFrequencyContinuationConfig:
-    return FreeFrequencyContinuationConfig(
+def build_config(args: argparse.Namespace) -> ContinuationFreeFrequencyConfig:
+    return ContinuationFreeFrequencyConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
@@ -72,7 +72,7 @@ def build_initial_coefficients(order: int) -> NDArray[np.float64]:
     return coefficients
 
 
-def save_result(result: FreeFrequencyContinuationResult, output: Path) -> None:
+def save_result(result: ContinuationFreeFrequencyResult, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         output,
@@ -87,7 +87,7 @@ def run_from_args(args: argparse.Namespace) -> None:
     model = VanderpolModel()
     config = build_config(args)
     order = 2 * len(HARMONICS) + 1
-    result = FreeFrequencyContinuationSolver(model, config).run(build_initial_coefficients(order))
+    result = ContinuationFreeFrequencySolver(model, config).run(build_initial_coefficients(order))
     save_result(result, args.output)
 
 

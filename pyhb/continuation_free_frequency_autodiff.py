@@ -16,12 +16,12 @@ from .autodiff_utils import (
     _to_numpy,
     _validate_autodiff_variables,
 )
-from .free_frequency import FreeFrequencyContinuationConfig, FreeFrequencyContinuationSolver
+from .continuation_free_frequency import ContinuationFreeFrequencyConfig, ContinuationFreeFrequencySolver
 from .models import AutodiffFreeFrequencySecondOrderTimeModel, JacobianVariable, NonlinearJacobianTerm
 
 
 @dataclass(frozen=True)
-class FreeFrequencyContinuationAutodiffConfig(FreeFrequencyContinuationConfig):
+class ContinuationFreeFrequencyAutodiffConfig(ContinuationFreeFrequencyConfig):
     """Free-frequency continuation config with an optional Torch device selector."""
 
     torch_device: str | None = None
@@ -36,23 +36,23 @@ class _FreeAutodiffCache:
     parameter_derivative: NDArray[np.float64]
 
 
-class FreeFrequencyContinuationAutodiffSolver(FreeFrequencyContinuationSolver):
+class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
     """Free-frequency continuation solver using Torch autodiff for local residual derivatives."""
 
     def __init__(
         self,
         model: AutodiffFreeFrequencySecondOrderTimeModel,
-        config: FreeFrequencyContinuationAutodiffConfig | None = None,
+        config: ContinuationFreeFrequencyAutodiffConfig | None = None,
     ) -> None:
         if not isinstance(model, AutodiffFreeFrequencySecondOrderTimeModel):
             raise TypeError(
-                "FreeFrequencyContinuationAutodiffSolver requires an "
+                "ContinuationFreeFrequencyAutodiffSolver requires an "
                 "AutodiffFreeFrequencySecondOrderTimeModel"
             )
         self._free_autodiff_cache: _FreeAutodiffCache | None = None
-        super().__init__(model, config or FreeFrequencyContinuationAutodiffConfig())
+        super().__init__(model, config or ContinuationFreeFrequencyAutodiffConfig())
         self.model: AutodiffFreeFrequencySecondOrderTimeModel
-        self.config: FreeFrequencyContinuationAutodiffConfig
+        self.config: ContinuationFreeFrequencyAutodiffConfig
         self._torch_device = _resolve_torch_device(self.config.torch_device)
         self._autodiff_variables = _validate_autodiff_variables(self.model.autodiff_variables)
 

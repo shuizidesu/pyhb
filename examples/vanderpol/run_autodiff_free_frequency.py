@@ -12,9 +12,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pyhb import (
-    FreeFrequencyContinuationAutodiffConfig,
-    FreeFrequencyContinuationAutodiffSolver,
-    FreeFrequencyContinuationResult,
+    ContinuationFreeFrequencyAutodiffConfig,
+    ContinuationFreeFrequencyAutodiffSolver,
+    ContinuationFreeFrequencyResult,
     HarmonicCoefficientConstraint,
 )
 from examples.vanderpol.autodiff_model import VanderpolAutodiffModel
@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_config(args: argparse.Namespace) -> FreeFrequencyContinuationAutodiffConfig:
-    return FreeFrequencyContinuationAutodiffConfig(
+def build_config(args: argparse.Namespace) -> ContinuationFreeFrequencyAutodiffConfig:
+    return ContinuationFreeFrequencyAutodiffConfig(
         sample_fft=args.sample_fft,
         harmonics=HARMONICS,
         frequency_resolution=FREQUENCY_RESOLUTION,
@@ -79,7 +79,7 @@ def build_initial_coefficients(order: int) -> NDArray[np.float64]:
     return coefficients
 
 
-def save_result(result: FreeFrequencyContinuationResult, output: Path) -> None:
+def save_result(result: ContinuationFreeFrequencyResult, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         output,
@@ -94,7 +94,7 @@ def run_from_args(args: argparse.Namespace) -> None:
     model = VanderpolAutodiffModel()
     config = build_config(args)
     order = 2 * len(HARMONICS) + 1
-    result = FreeFrequencyContinuationAutodiffSolver(model, config).run(build_initial_coefficients(order))
+    result = ContinuationFreeFrequencyAutodiffSolver(model, config).run(build_initial_coefficients(order))
     save_result(result, args.output)
 
 

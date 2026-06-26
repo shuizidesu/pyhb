@@ -36,8 +36,8 @@ The main solver and postprocessing entry points are:
 
 - `ContinuationSolver` for full-system analytical nonlinear Jacobians.
 - `ContinuationAutodiffSolver` for full-system Torch autodiff nonlinear derivatives.
-- `FreeFrequencyContinuationSolver` for autonomous systems where the response frequency is unknown.
-- `FreeFrequencyContinuationAutodiffSolver` for Torch autodiff derivatives in free-frequency systems.
+- `ContinuationFreeFrequencySolver` for autonomous systems where the response frequency is unknown.
+- `ContinuationFreeFrequencyAutodiffSolver` for Torch autodiff derivatives in free-frequency systems.
 - `compute_floquet` for analytical-model Floquet stability postprocessing.
 - `compute_floquet_autodiff` for Torch autodiff Floquet stability postprocessing.
 - `compute_free_frequency_floquet` and `compute_free_frequency_floquet_autodiff` for free-frequency
@@ -61,7 +61,7 @@ print(result.parameter_history)
 ```
 
 For Torch-based nonlinear derivatives, install the `autodiff` extra and use `ContinuationAutodiffSolver`
-or `FreeFrequencyContinuationAutodiffSolver`.
+or `ContinuationFreeFrequencyAutodiffSolver`.
 
 ## Examples
 

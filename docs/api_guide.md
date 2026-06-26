@@ -31,8 +31,8 @@ Most users start from objects exported by `pyhb.__init__`:
 - `SecondOrderTimeModel` and `AutodiffSecondOrderTimeModel` define model
   interfaces.
 - `ContinuationSolver`, `ContinuationAutodiffSolver`,
-  `FreeFrequencyContinuationSolver`, and
-  `FreeFrequencyContinuationAutodiffSolver` run harmonic-balance continuation.
+  `ContinuationFreeFrequencySolver`, and
+  `ContinuationFreeFrequencyAutodiffSolver` run harmonic-balance continuation.
 - `compute_floquet`, `compute_free_frequency_floquet`, and their autodiff
   counterparts compute Floquet multipliers for accepted HB solutions.
 - `FrequencyGrid` and `build_full_fft_nonlinear_harmonics` expose the frequency
@@ -50,9 +50,9 @@ Lower-level modules provide the assembly building blocks used by the solvers:
   correction matrix, then runs weighted arc-length continuation.
 - `pyhb.continuation_autodiff` reuses the full continuation loop but obtains
   nonlinear derivatives from Torch autodiff.
-- `pyhb.free_frequency` handles autonomous/free-frequency systems where the
+- `pyhb.continuation_free_frequency` handles autonomous/free-frequency systems where the
   response frequency is an unknown.
-- `pyhb.free_frequency_autodiff` applies Torch autodiff to the same
+- `pyhb.continuation_free_frequency_autodiff` applies Torch autodiff to the same
   free-frequency continuation loop.
 - `pyhb.floquet` reconstructs one HB solution, samples analytical nonlinear
   Jacobians in time, and computes monodromy multipliers.
@@ -381,7 +381,7 @@ generation path is replaced by Torch autodiff.
 
 ## Free-Frequency Continuation
 
-Use `FreeFrequencyContinuationSolver` for autonomous systems where the response
+Use `ContinuationFreeFrequencySolver` for autonomous systems where the response
 frequency is unknown and the continuation parameter is a separate scalar, such
 as van der Pol limit-cycle continuation.
 
@@ -410,7 +410,7 @@ Optional derivatives default to zero:
 - `local_residual_omega_derivative(...)`
 - `local_residual_parameter_derivative(...)`
 
-`FreeFrequencyContinuationConfig` extends `ContinuationConfig` with:
+`ContinuationFreeFrequencyConfig` extends `ContinuationConfig` with:
 
 - `init_parameter`: initial value of the true continuation parameter.
 - `parameter_scale`: weighted arc-length scale for the true continuation
@@ -424,13 +424,13 @@ Arc-length continuation uses `[q, omega, parameter]`. The constraint row is
 assembled by the solver and contains a single `1` at the constrained coefficient
 column.
 
-`FreeFrequencyContinuationResult` stores:
+`ContinuationFreeFrequencyResult` stores:
 
 - `parameter_history`: accepted true continuation parameter values.
 - `omega_history`: accepted response frequencies.
 - `coefficient_history`: accepted HB coefficient history.
 
-`FreeFrequencyContinuationAutodiffSolver` uses
+`ContinuationFreeFrequencyAutodiffSolver` uses
 `AutodiffFreeFrequencySecondOrderTimeModel`. The model supplies
 `local_residual_force_torch(...)`, and Torch autodiff builds the local
 derivatives controlled by `autodiff_variables`, `autodiff_omega_dependent`, and

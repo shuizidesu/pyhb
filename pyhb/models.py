@@ -716,7 +716,7 @@ class AutodiffFreeFrequencySecondOrderTimeModel(FreeFrequencySecondOrderTimeMode
     ) -> tuple[LocalResidualJacobianTerm, ...]:
         """Autodiff models do not expose handwritten residual Jacobian terms."""
 
-        raise NotImplementedError("use FreeFrequencyContinuationAutodiffSolver")
+        raise NotImplementedError("use ContinuationFreeFrequencyAutodiffSolver")
 
     def local_residual_omega_derivative(
         self,
@@ -731,7 +731,7 @@ class AutodiffFreeFrequencySecondOrderTimeModel(FreeFrequencySecondOrderTimeMode
 
         if not self.autodiff_omega_dependent:
             return np.zeros((t.size, len(self.residual_force_dofs)), dtype=np.float64)
-        raise NotImplementedError("use FreeFrequencyContinuationAutodiffSolver for omega-dependent autodiff residuals")
+        raise NotImplementedError("use ContinuationFreeFrequencyAutodiffSolver for omega-dependent autodiff residuals")
 
     def local_residual_parameter_derivative(
         self,
@@ -746,4 +746,4 @@ class AutodiffFreeFrequencySecondOrderTimeModel(FreeFrequencySecondOrderTimeMode
 
         if not self.autodiff_parameter_dependent:
             return np.zeros((t.size, len(self.residual_force_dofs)), dtype=np.float64)
-        raise NotImplementedError("use FreeFrequencyContinuationAutodiffSolver for parameter-dependent autodiff residuals")
+        raise NotImplementedError("use ContinuationFreeFrequencyAutodiffSolver for parameter-dependent autodiff residuals")

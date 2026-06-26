@@ -25,7 +25,7 @@ from .models import FreeFrequencySecondOrderTimeModel, HarmonicCoefficientConstr
 
 
 @dataclass(frozen=True)
-class FreeFrequencyContinuationConfig(ContinuationConfig):
+class ContinuationFreeFrequencyConfig(ContinuationConfig):
     """Continuation config for autonomous free-frequency HB systems."""
 
     init_parameter: float = 0.5
@@ -38,7 +38,7 @@ class FreeFrequencyContinuationConfig(ContinuationConfig):
 
 
 @dataclass(frozen=True)
-class FreeFrequencyStepLog:
+class ContinuationFreeFrequencyStepLog:
     step: int
     epoch: int
     max_residual: float
@@ -52,7 +52,7 @@ class FreeFrequencyStepLog:
 
 
 @dataclass(frozen=True)
-class FreeFrequencyContinuationResult:
+class ContinuationFreeFrequencyResult:
     coefficients: NDArray[np.float64]
     omega: float
     parameter: float
@@ -63,23 +63,23 @@ class FreeFrequencyContinuationResult:
     nonlinear_harmonics: NDArray[np.float64]
     frequency_resolution: float
     period: float
-    logs: list[FreeFrequencyStepLog] = field(default_factory=list)
-    initial_log: FreeFrequencyStepLog | None = None
+    logs: list[ContinuationFreeFrequencyStepLog] = field(default_factory=list)
+    initial_log: ContinuationFreeFrequencyStepLog | None = None
 
 
-class FreeFrequencyContinuationSolver(ContinuationSolver):
+class ContinuationFreeFrequencySolver(ContinuationSolver):
     """Arc-length continuation with unknown response frequency and one true parameter."""
 
     def __init__(
         self,
         model: FreeFrequencySecondOrderTimeModel,
-        config: FreeFrequencyContinuationConfig | None = None,
+        config: ContinuationFreeFrequencyConfig | None = None,
     ) -> None:
         if not isinstance(model, FreeFrequencySecondOrderTimeModel):
-            raise TypeError("FreeFrequencyContinuationSolver requires a FreeFrequencySecondOrderTimeModel")
-        super().__init__(model, config or FreeFrequencyContinuationConfig())
+            raise TypeError("ContinuationFreeFrequencySolver requires a FreeFrequencySecondOrderTimeModel")
+        super().__init__(model, config or ContinuationFreeFrequencyConfig())
         self.model: FreeFrequencySecondOrderTimeModel
-        self.config: FreeFrequencyContinuationConfig
+        self.config: ContinuationFreeFrequencyConfig
         _validate_positive_scale("parameter_scale", self.config.parameter_scale)
         _validate_positive_scale("constraint_tolerance", self.config.constraint_tolerance)
         _validate_optional_positive_scale("max_parameter_step", self.config.max_parameter_step)
@@ -268,7 +268,7 @@ class FreeFrequencyContinuationSolver(ContinuationSolver):
         coeff_line: NDArray[np.float64],
         omega: float,
         parameter: float,
-    ) -> tuple[NDArray[np.float64], float, NDArray[np.float64], NDArray[np.float64], sparse.csc_matrix, FreeFrequencyStepLog]:
+    ) -> tuple[NDArray[np.float64], float, NDArray[np.float64], NDArray[np.float64], sparse.csc_matrix, ContinuationFreeFrequencyStepLog]:
         config = self.config
         epoch = 1
         residual_vector = np.full(coeff_line.shape, np.inf, dtype=np.float64)
@@ -310,7 +310,7 @@ class FreeFrequencyContinuationSolver(ContinuationSolver):
         residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
         constraint_residual = self._constraint_residual(coeff_line)
         max_delta = float(np.max(np.abs(delta)))
-        log = FreeFrequencyStepLog(
+        log = ContinuationFreeFrequencyStepLog(
             step=0,
             epoch=epoch,
             relative_residual=residual_stats.relative_residual,
@@ -375,7 +375,7 @@ class FreeFrequencyContinuationSolver(ContinuationSolver):
         initial_coefficients: NDArray[np.float64],
         initial_omega: float | None = None,
         initial_parameter: float | None = None,
-    ) -> FreeFrequencyContinuationResult:
+    ) -> ContinuationFreeFrequencyResult:
         """Run initial free-frequency Newton solve followed by arc-length continuation."""
 
         config = self.config
@@ -404,7 +404,7 @@ class FreeFrequencyContinuationSolver(ContinuationSolver):
         omega_history: list[float] = [float(omega)] if initial_log.converged else []
         parameter_history: list[float] = [float(parameter)] if initial_log.converged else []
         coefficient_history: list[NDArray[np.float64]] = [coeff.copy()] if initial_log.converged else []
-        logs: list[FreeFrequencyStepLog] = []
+        logs: list[ContinuationFreeFrequencyStepLog] = []
         arc_length_step = float(config.s_initial)
         shrink_count = 0
 
@@ -479,7 +479,7 @@ class FreeFrequencyContinuationSolver(ContinuationSolver):
                 raw_parameter_step_too_large = _parameter_step_too_large(config.max_parameter_step, parameter_step)
                 parameter_step_too_large = bool(converged and raw_parameter_step_too_large)
                 accepted = bool(converged and not parameter_step_too_large)
-                step_log = FreeFrequencyStepLog(
+                step_log = ContinuationFreeFrequencyStepLog(
                     step=step,
                     epoch=epoch,
                     max_residual=residual_stats.max_residual,
@@ -550,7 +550,7 @@ class FreeFrequencyContinuationSolver(ContinuationSolver):
             if coefficient_history
             else np.empty((0, self.prepared.context.order, self.model.n_dof), dtype=np.float64)
         )
-        return FreeFrequencyContinuationResult(
+        return ContinuationFreeFrequencyResult(
             coefficients=final_coeff,
             omega=float(y0[-2]),
             parameter=float(y0[-1]),
