@@ -30,7 +30,7 @@ RES_TOLERANCE = 1e-10
 DELTA_TOLERANCE = 1e-12
 Q_SCALE = 1e-4
 OMEGA_SCALE = 100
-MAX_PARAMETER_STEP = 0.5
+MAX_PARAMETER_STEP = 0.7
 DEFAULT_PLOT_DOFS = (34, 176, 68, 210)
 
 
@@ -40,8 +40,6 @@ def harmonic_range(start: float, stop: float, step: float) -> tuple[float, ...]:
 
 
 HARMONICS = harmonic_range(0.5, 3.1, 0.1)
-# HARMONICS = (1.0, 1.2)
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the aero-engine rotor pyHB arc-length example.")

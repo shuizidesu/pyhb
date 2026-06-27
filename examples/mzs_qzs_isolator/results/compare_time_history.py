@@ -29,7 +29,7 @@ INTEGRATION_METHODS = ("DOP853", "RK45", "Radau", "BDF")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare MZS-QZS HB and ODE time histories at one continuation point.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--index", type=int, default=10)
     parser.add_argument("--periods", type=int, default=DEFAULT_PERIODS)
     parser.add_argument("--points-per-period", type=int, default=DEFAULT_POINTS_PER_PERIOD)
     parser.add_argument("--dofs", type=int, nargs="+", default=DEFAULT_PLOT_DOFS)

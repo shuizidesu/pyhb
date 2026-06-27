@@ -26,7 +26,7 @@ RES_TOLERANCE = 1e-4
 DELTA_TOLERANCE = 1e-8
 Q_SCALE = 1.0
 OMEGA_SCALE = 5.0
-HARMONICS = tuple(float(value) for value in range(1, 11))
+HARMONICS = tuple(float(value) for value in range(1, 6))
 DEFAULT_PLOT_DOFS = (1998,)
 
 
