@@ -13,34 +13,34 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pyhb import FloquetConfig, compute_floquet_autodiff
 from pyhb.harmonics import generate_hb_items
-from examples.bilinear_hysteretic.autodiff_model import BilinearHystereticAutodiffModel
-from examples.bilinear_hysteretic.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
+from examples.mzs_qzs_isolator.autodiff_model import MzsQzsAutodiffModel
+from examples.mzs_qzs_isolator.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
 
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
-DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
-DEFAULT_OUTPUT_RMS = Path(__file__).resolve().parent / "results" / "autodiff_arc_rms.npz"
-DEFAULT_OUTPUT_FLOQUET = Path(__file__).resolve().parent / "results" / "autodiff_arc_floquet.npz"
+DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
+DEFAULT_RMS_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc_rms.npz"
+DEFAULT_STABILITY_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc_floquet.npz"
 DEFAULT_SAMPLE_COUNT = 2048
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Postprocess the bilinear hysteretic autodiff continuation result.")
+    parser = argparse.ArgumentParser(description="Postprocess the MZS-QZS isolator autodiff continuation result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FIG)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--dofs", type=int, nargs="+", default=DEFAULT_PLOT_DOFS)
-    parser.add_argument("--rms-output", type=Path, default=DEFAULT_OUTPUT_RMS)
+    parser.add_argument("--rms-output", type=Path, default=DEFAULT_RMS_OUTPUT)
     parser.add_argument("--no-stability", action="store_true")
-    parser.add_argument("--stability-output", type=Path, default=DEFAULT_OUTPUT_FLOQUET)
+    parser.add_argument("--stability-output", type=Path, default=DEFAULT_STABILITY_OUTPUT)
     parser.add_argument("--hsu-samples", type=int, default=512)
     parser.add_argument("--floquet-method", choices=("trapezoid", "exponential"), default="exponential")
-    parser.add_argument("--stability-tolerance", type=float, default=1e-2)
+    parser.add_argument("--stability-tolerance", type=float, default=1e-4)
     parser.add_argument("--torch-device", type=str, default=None)
     return parser.parse_args()
 
 
-def compute_response_history(
+def compute_rms_history(
     coefficient_history: NDArray[np.float64],
     dofs: tuple[int, ...],
     sample_count: int,
@@ -49,15 +49,7 @@ def compute_response_history(
     t = np.arange(sample_count, dtype=np.float64) * (period / sample_count)
     hb_item, _, _ = generate_hb_items(t, HARMONICS)
     selected_coefficients = coefficient_history[:, :, list(dofs)]
-    return np.einsum("to,sod->std", hb_item, selected_coefficients)
-
-
-def compute_rms_history(
-    coefficient_history: NDArray[np.float64],
-    dofs: tuple[int, ...],
-    sample_count: int,
-) -> NDArray[np.float64]:
-    response = compute_response_history(coefficient_history, dofs, sample_count)
+    response = np.einsum("to,sod->std", hb_item, selected_coefficients)
     return np.sqrt(np.mean(response * response, axis=1))
 
 
@@ -92,7 +84,7 @@ def compute_stability_history(
     stability_tolerance: float,
     torch_device: str | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.complex128]]:
-    model = BilinearHystereticAutodiffModel()
+    model = MzsQzsAutodiffModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
         method=floquet_method,
@@ -180,16 +172,15 @@ def run_from_args(args: argparse.Namespace) -> None:
             getattr(args, "torch_device", None),
         )
     save_plot(parameter_history, rms_history, dofs, args.output, stable_history)
-    rms_output = getattr(args, "rms_output", None)
-    if rms_output is not None:
-        rms_output.parent.mkdir(parents=True, exist_ok=True)
+    if args.rms_output is not None:
+        args.rms_output.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
-            rms_output,
+            args.rms_output,
             omega=parameter_history,
             rms_history=rms_history,
             dofs=np.asarray(dofs, dtype=np.int64),
         )
-        print(f"Saved RMS table to {rms_output}")
+        print(f"Saved RMS table to {args.rms_output}")
     stability_output = getattr(args, "stability_output", None)
     if (
         stability_output is not None

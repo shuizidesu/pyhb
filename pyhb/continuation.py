@@ -8,12 +8,10 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
-from scipy.sparse.linalg import splu
 
 from .continuation_core import (
     _PreparedProblem,
     _ResidualStats,
-    _augmented_arc_matrix,
     _coefficient_matrix,
     _combine_powered_dense_blocks,
     _combine_powered_sparse_blocks,
@@ -24,6 +22,7 @@ from .continuation_core import (
     _prepare_structured_parameter_blocks,
     _residual_stats,
     _shrink_arc_length_for_parameter_step,
+    _solve_one_parameter_bordered_arc,
     _solve_sparse,
     _validated_dofs,
     _validate_optional_positive_scale,
@@ -415,7 +414,7 @@ class ContinuationSolver:
                 residual_vector = np.full(self.model.n_dof * order, np.inf, dtype=np.float64)
                 residual_stats = _ResidualStats(np.inf, np.inf)
                 delta = np.full(self.model.n_dof * order + 1, np.inf, dtype=np.float64)
-                j_arc_lu = None
+                arc_solve = None
 
                 while (
                     epoch < config.max_epoch
@@ -429,18 +428,15 @@ class ContinuationSolver:
                     residual_vector = residual_terms[0]
                     residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
                     j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter)
-                    r_arc = np.concatenate(
-                        (
-                            residual_vector,
-                            np.array(
-                                [self._weighted_inner(y - y0, tangent) - arc_length_step],
-                                dtype=np.float64,
-                            ),
-                        )
+                    arc_residual = self._weighted_inner(y - y0, tangent) - arc_length_step
+                    arc_solve = _solve_one_parameter_bordered_arc(
+                        jacobian,
+                        j_parameter,
+                        self._weighted_constraint_row(tangent),
+                        residual_vector,
+                        arc_residual,
                     )
-                    j_arc_v = _augmented_arc_matrix(jacobian, j_parameter, self._weighted_constraint_row(tangent))
-                    j_arc_lu = splu(j_arc_v)
-                    delta = j_arc_lu.solve(r_arc)
+                    delta = arc_solve.delta
                     y = y - delta
                     coeff_line = y[:-1].copy()
                     parameter = float(y[-1])
@@ -478,12 +474,9 @@ class ContinuationSolver:
 
                 if accepted:
                     y0 = y.copy()
-                    if j_arc_lu is None:
+                    if arc_solve is None:
                         raise RuntimeError("converged before assembling arc Jacobian")
-                    tangent_candidate = j_arc_lu.solve(
-                        np.concatenate((np.zeros(jacobian.shape[0]), np.array([1.0])))
-                    )
-                    tangent = self._weighted_normalize(tangent_candidate)
+                    tangent = self._weighted_normalize(arc_solve.tangent_candidate)
                     coeff = self._coefficient_matrix(coeff_line)
                     parameter_history.append(float(parameter))
                     coefficient_history.append(coeff.copy())

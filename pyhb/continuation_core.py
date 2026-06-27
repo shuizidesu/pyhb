@@ -33,6 +33,12 @@ class _ResidualStats:
     max_residual: float
 
 
+@dataclass(frozen=True)
+class _BorderedArcSolve:
+    delta: NDArray[np.float64]
+    tangent_candidate: NDArray[np.float64]
+
+
 def assemble_hb_jacobian_from_terms(
     terms: tuple[NonlinearJacobianTerm, ...],
     context: HBContext,
@@ -374,6 +380,52 @@ def _parameter_derivative_scale(parameter: float, power: float) -> float:
 
 def _solve_sparse(matrix: sparse.spmatrix, rhs: NDArray[np.float64]) -> NDArray[np.float64]:
     return splu(matrix.tocsc()).solve(np.asarray(rhs, dtype=np.float64))
+
+
+def _solve_one_parameter_bordered_arc(
+    jacobian: sparse.spmatrix,
+    parameter_column: NDArray[np.float64],
+    arc_row: NDArray[np.float64],
+    residual_vector: NDArray[np.float64],
+    arc_residual: float,
+) -> _BorderedArcSolve:
+    """Solve the one-parameter arc-length bordered system without factoring it.
+
+    This is algebraically equivalent to solving ``[[-J, p], [w_q, w_a]]``,
+    but only factors ``J``.  Avoiding the dense arc-length row in the sparse
+    LU factorization keeps large full-system problems from suffering excessive
+    fill-in.
+    """
+
+    size = jacobian.shape[0]
+    parameter_column_vector = np.asarray(parameter_column, dtype=np.float64).reshape(size)
+    arc_vector = np.asarray(arc_row, dtype=np.float64).reshape(size + 1)
+    residual = np.asarray(residual_vector, dtype=np.float64).reshape(size)
+    arc_q = arc_vector[:-1]
+    arc_parameter = float(arc_vector[-1])
+
+    lu = splu(jacobian.tocsc())
+    residual_solve = lu.solve(-residual)
+    parameter_solve = lu.solve(parameter_column_vector)
+    denominator = float(arc_q @ parameter_solve + arc_parameter)
+    tolerance = 100.0 * np.finfo(np.float64).eps * max(
+        1.0,
+        float(np.linalg.norm(arc_q) * np.linalg.norm(parameter_solve) + abs(arc_parameter)),
+    )
+    if abs(denominator) <= tolerance:
+        raise np.linalg.LinAlgError(
+            "arc bordered solve is singular or ill-conditioned; "
+            f"denominator={denominator:.6e}, tolerance={tolerance:.6e}"
+        )
+
+    parameter_delta = (float(arc_residual) - float(arc_q @ residual_solve)) / denominator
+    coefficient_delta = residual_solve + parameter_solve * parameter_delta
+    tangent_parameter = 1.0 / denominator
+    tangent_coefficients = parameter_solve * tangent_parameter
+    return _BorderedArcSolve(
+        delta=np.concatenate((coefficient_delta, np.array([parameter_delta], dtype=np.float64))),
+        tangent_candidate=np.concatenate((tangent_coefficients, np.array([tangent_parameter], dtype=np.float64))),
+    )
 
 
 def _rms(values: NDArray[np.float64]) -> float:
