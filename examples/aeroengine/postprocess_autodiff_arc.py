@@ -11,11 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import FloquetConfig, compute_floquet_autodiff
-from pyhb.harmonics import generate_hb_items
 from examples.aeroengine.autodiff_model import AeroEngineAutodiffRotorModel
 from examples.aeroengine.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
-
+from pyhb import FloquetConfig, compute_floquet_autodiff
+from pyhb.harmonics import generate_hb_items
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc_190.npz"
 DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
@@ -109,7 +108,9 @@ def compute_stability_history(
             torch_device=torch_device,
         )
         status = "stable" if result.stable else "unstable"
-        print(f"Floquet {index}/{total} done, omega={float(parameter):.10g}, rho={result.spectral_radius:.6e}, {status}")
+        print(
+            f"Floquet {index}/{total} done, omega={float(parameter):.10g}, rho={result.spectral_radius:.6e}, {status}"
+        )
         spectral_radius.append(result.spectral_radius)
         stable.append(result.stable)
         multipliers.append(result.multipliers)

@@ -11,10 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from examples.vanderpol.autodiff_model import VanderpolAutodiffModel
 from pyhb import FloquetConfig, compute_free_frequency_floquet_autodiff
 from pyhb.harmonics import generate_hb_items
-from examples.vanderpol.autodiff_model import VanderpolAutodiffModel
-
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency.npz"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_free_frequency.png"

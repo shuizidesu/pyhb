@@ -10,7 +10,6 @@ from scipy.io import loadmat
 
 from pyhb import AutodiffSecondOrderTimeModel, ForcingTerm, LinearOperatorTerm
 
-
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"
 
 
@@ -71,9 +70,14 @@ class AeroEngineAutodiffRotorModel(AutodiffSecondOrderTimeModel):
         self.bearing_ox = self._node_x_indices((parameters.bearing_node_o,))[0]
         self.bearing_iy = self.bearing_ix + self._n_dof // 2
         self.bearing_oy = self.bearing_ox + self._n_dof // 2
-        self.roller_phase = 2.0 * np.pi / parameters.bearing_nb * np.arange(
-            parameters.bearing_nb,
-            dtype=np.float64,
+        self.roller_phase = (
+            2.0
+            * np.pi
+            / parameters.bearing_nb
+            * np.arange(
+                parameters.bearing_nb,
+                dtype=np.float64,
+            )
         )
 
     @property

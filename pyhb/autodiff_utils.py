@@ -17,7 +17,7 @@ def _resolve_torch_device(device: str | None) -> torch.device:
 
 def _validate_autodiff_variables(variables: tuple[JacobianVariable, ...]) -> tuple[JacobianVariable, ...]:
     normalized = tuple(variables)
-    allowed = {"x", "dx", "ddx"}
+    allowed: set[JacobianVariable] = {"x", "dx", "ddx"}
     if len(set(normalized)) != len(normalized):
         raise ValueError("autodiff_variables must not contain duplicates")
     unsupported = set(normalized) - allowed

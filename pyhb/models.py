@@ -5,12 +5,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
-
 
 JacobianVariable = Literal["x", "dx", "ddx"]
 LinearBasisType = Literal["ddx", "dx", "x"]
@@ -257,8 +256,7 @@ class SecondOrderTimeModel(ABC):
         expected_shape = (t.size, len(force_dofs))
         if local_derivative.shape != expected_shape:
             raise ValueError(
-                "local nonlinear parameter derivative must have shape "
-                f"{expected_shape}, got {local_derivative.shape}"
+                f"local nonlinear parameter derivative must have shape {expected_shape}, got {local_derivative.shape}"
             )
         derivative = np.zeros((t.size, self.n_dof), dtype=np.float64)
         derivative[:, list(force_dofs)] = local_derivative
@@ -291,7 +289,7 @@ class SecondOrderTimeModel(ABC):
 
 def _as_dense_matrix(matrix: NDArray[np.float64] | sparse.spmatrix) -> NDArray[np.float64]:
     if sparse.issparse(matrix):
-        return np.asarray(matrix.toarray(), dtype=np.float64)
+        return np.asarray(cast(sparse.spmatrix, matrix).toarray(), dtype=np.float64)
     return np.asarray(matrix, dtype=np.float64)
 
 
@@ -757,4 +755,6 @@ class AutodiffFreeFrequencySecondOrderTimeModel(FreeFrequencySecondOrderTimeMode
 
         if not self.autodiff_parameter_dependent:
             return np.zeros((t.size, len(self.residual_force_dofs)), dtype=np.float64)
-        raise NotImplementedError("use ContinuationFreeFrequencyAutodiffSolver for parameter-dependent autodiff residuals")
+        raise NotImplementedError(
+            "use ContinuationFreeFrequencyAutodiffSolver for parameter-dependent autodiff residuals"
+        )

@@ -10,8 +10,8 @@ from numpy.typing import NDArray
 from scipy import sparse
 
 from .continuation_core import (
-    _PreparedProblem,
-    _ResidualStats,
+    _ArcLengthMetric,
+    _array_is_finite,
     _coefficient_matrix,
     _combine_powered_dense_blocks,
     _combine_powered_sparse_blocks,
@@ -19,18 +19,20 @@ from .continuation_core import (
     _local_jacobian_terms_to_global,
     _local_samples_to_global_coefficients,
     _parameter_step_too_large,
-    _prepare_structured_parameter_blocks,
+    _PoweredEvaluation,
+    _prepare_continuation_problem,
     _residual_stats,
+    _ResidualStats,
     _shrink_arc_length_for_parameter_step,
     _solve_one_parameter_bordered_arc,
     _solve_sparse,
-    _validated_dofs,
+    _sparse_is_finite,
     _validate_optional_positive_scale,
     _validate_positive_scale,
+    _validated_dofs,
     assemble_hb_jacobian_from_terms,
 )
-from .harmonics import flatten_coefficients, generate_hb_items
-from .hb_operators import HBContext, build_full_fft_nonlinear_harmonics
+from .harmonics import flatten_coefficients
 from .models import SecondOrderTimeModel
 
 
@@ -38,12 +40,12 @@ from .models import SecondOrderTimeModel
 class ContinuationConfig:
     sample_fft: int = 2**11
     harmonics: tuple[float, ...] = tuple(float(v) for v in range(1, 11))
-    nonlinear_harmonics: tuple[float, ...] | None = None
     frequency_resolution: float = 1.0
     frequency_tolerance: float = 1e-10
     s3_method: str = "fast"
     s3_quadrature_samples: int | None = None
     init_omega: float = 300.0
+    initial_direction: str = "up"
     max_epoch: int = 10
     res_tolerance: float = 1e-10
     delta_tolerance: float = 1e-10
@@ -93,55 +95,35 @@ class _NonlinearEvaluation:
     parameter_coefficients: NDArray[np.float64] | None = None
 
 
+def _nonlinear_evaluation_is_finite(nonlinear: _NonlinearEvaluation) -> bool:
+    return (
+        _array_is_finite(nonlinear.coefficients)
+        and _sparse_is_finite(nonlinear.jacobian)
+        and (nonlinear.parameter_coefficients is None or _array_is_finite(nonlinear.parameter_coefficients))
+    )
+
+
 class ContinuationSolver:
     """Generic single-parameter arc-length continuation solver."""
 
     def __init__(self, model: SecondOrderTimeModel, config: ContinuationConfig | None = None) -> None:
         self.model = model
         self.config = config or ContinuationConfig()
-        _validate_positive_scale("q_scale", self.config.q_scale)
-        _validate_positive_scale("omega_scale", self.config.omega_scale)
-        _validate_optional_positive_scale("max_parameter_step", self.config.max_parameter_step)
-        _validate_positive_scale("parameter_step_safety", self.config.parameter_step_safety)
-        _validate_positive_scale("residual_floor", self.config.residual_floor)
-        self.prepared = self._prepare()
-
-    def _prepare(self) -> _PreparedProblem:
-        config = self.config
-        active_nonlinear_harmonics = config.nonlinear_harmonics or build_full_fft_nonlinear_harmonics(
-            config.sample_fft,
-            config.frequency_resolution,
-        )
-        context = HBContext.build(
-            config.harmonics,
-            active_nonlinear_harmonics,
-            config.sample_fft,
-            config.frequency_resolution,
-            config.frequency_tolerance,
-            config.s3_method,
-            config.s3_quadrature_samples,
-            config.progress_callback,
-        )
-        self._emit_progress(
-            f"Generating HB basis... period={context.period:.12g}, samples={config.sample_fft}"
-        )
-        t = np.arange(config.sample_fft, dtype=np.float64) * (context.period / config.sample_fft)
-        hb_item, hb_item_dt, hb_item_ddt = generate_hb_items(t, context.harmonics)
-        operator_blocks, forcing_blocks = _prepare_structured_parameter_blocks(
+        _validate_continuation_config(self.config)
+        self.prepared = _prepare_continuation_problem(
             self.model,
-            context,
-            t,
-            config.sample_fft,
+            sample_fft=self.config.sample_fft,
+            harmonics=self.config.harmonics,
+            frequency_resolution=self.config.frequency_resolution,
+            frequency_tolerance=self.config.frequency_tolerance,
+            s3_method=self.config.s3_method,
+            s3_quadrature_samples=self.config.s3_quadrature_samples,
+            progress_callback=self.config.progress_callback,
         )
-        return _PreparedProblem(
-            self.model,
-            context,
-            t,
-            hb_item,
-            hb_item_dt,
-            hb_item_ddt,
-            operator_blocks,
-            forcing_blocks,
+        self._arc_metric = _ArcLengthMetric.build(
+            self.model.n_dof * self.prepared.context.order,
+            self.config.q_scale,
+            (self.config.omega_scale,),
         )
 
     def _emit_progress(self, message: str) -> None:
@@ -181,9 +163,11 @@ class ContinuationSolver:
         coeff_line: NDArray[np.float64],
         nonlinear: _NonlinearEvaluation,
         parameter: float,
+        powered: _PoweredEvaluation | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        forcing_coefficients = self._forcing_coefficients(parameter)
-        linear_coefficients = self._linear_jacobian(parameter) @ coeff_line
+        active_powered = powered or self.prepared.evaluate_powered(parameter, derivative=False)
+        forcing_coefficients = active_powered.forcing
+        linear_coefficients = active_powered.operator @ coeff_line
         residual = forcing_coefficients - nonlinear.coefficients - linear_coefficients
         return residual, forcing_coefficients, nonlinear.coefficients, linear_coefficients
 
@@ -191,8 +175,10 @@ class ContinuationSolver:
         self,
         nonlinear: _NonlinearEvaluation,
         parameter: float,
+        powered: _PoweredEvaluation | None = None,
     ) -> sparse.csc_matrix:
-        return self._linear_jacobian(parameter) + nonlinear.jacobian
+        active_powered = powered or self.prepared.evaluate_powered(parameter, derivative=False)
+        return active_powered.operator + nonlinear.jacobian
 
     def _evaluate_nonlinear(
         self,
@@ -272,13 +258,17 @@ class ContinuationSolver:
         coeff_line: NDArray[np.float64],
         nonlinear: _NonlinearEvaluation,
         parameter: float,
+        powered: _PoweredEvaluation | None = None,
     ) -> NDArray[np.float64]:
         if nonlinear.parameter_coefficients is None:
             raise ValueError("nonlinear evaluation does not include parameter coefficients")
+        active_powered = powered or self.prepared.evaluate_powered(parameter, derivative=True)
+        if active_powered.forcing_derivative is None or active_powered.operator_derivative is None:
+            raise ValueError("powered evaluation does not include parameter derivatives")
         parameter_column = (
-            self._forcing_derivative_coefficients(parameter)
+            active_powered.forcing_derivative
             - nonlinear.parameter_coefficients
-            - self._linear_jacobian_derivative(parameter) @ coeff_line
+            - active_powered.operator_derivative @ coeff_line
         )
         return parameter_column.reshape(-1, 1)
 
@@ -286,7 +276,14 @@ class ContinuationSolver:
         self,
         coeff_line: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], _NonlinearEvaluation, sparse.csc_matrix, StepLog]:
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        _NonlinearEvaluation,
+        sparse.csc_matrix,
+        _PoweredEvaluation,
+        StepLog,
+    ]:
         config = self.config
         epoch = 1
         residual_vector = np.full(coeff_line.shape, np.inf, dtype=np.float64)
@@ -303,8 +300,9 @@ class ContinuationSolver:
         ):
             coeff = self._coefficient_matrix(coeff_line)
             nonlinear = self._evaluate_nonlinear(coeff, parameter, include_parameter=False)
-            jacobian = self._jacobian(nonlinear, parameter)
-            residual_terms = self._residual_terms(coeff_line, nonlinear, parameter)
+            powered = self.prepared.evaluate_powered(parameter, derivative=False)
+            jacobian = self._jacobian(nonlinear, parameter, powered)
+            residual_terms = self._residual_terms(coeff_line, nonlinear, parameter, powered)
             residual_vector = residual_terms[0]
             residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
             delta = _solve_sparse(jacobian, residual_vector)
@@ -313,7 +311,8 @@ class ContinuationSolver:
 
         coeff = self._coefficient_matrix(coeff_line)
         nonlinear = self._evaluate_nonlinear(coeff, parameter, include_parameter=True)
-        jacobian = self._jacobian(nonlinear, parameter)
+        powered = self.prepared.evaluate_powered(parameter, derivative=True)
+        jacobian = self._jacobian(nonlinear, parameter, powered)
         log = StepLog(
             step=0,
             epoch=epoch,
@@ -327,37 +326,20 @@ class ContinuationSolver:
                 or np.max(np.abs(delta)) < config.delta_tolerance
             ),
         )
-        return coeff_line, coeff, nonlinear, jacobian, log
+        return coeff_line, coeff, nonlinear, jacobian, powered, log
 
     def _orient_initial_tangent(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
         oriented = np.asarray(tangent, dtype=np.float64)
-        if oriented[-1] < 0.0:
+        direction = 1.0 if self.config.initial_direction == "up" else -1.0
+        if oriented[-1] * direction < 0.0:
             oriented = -oriented
-        return self._weighted_normalize(oriented)
+        return self._arc_metric.normalize(oriented)
 
-    def _initial_tangent(self, jacobian: sparse.csc_matrix, parameter_column: NDArray[np.float64]) -> NDArray[np.float64]:
+    def _initial_tangent(
+        self, jacobian: sparse.csc_matrix, parameter_column: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
         tangent_q = _solve_sparse(jacobian, parameter_column.reshape(-1))
         return self._orient_initial_tangent(np.concatenate((tangent_q, np.array([1.0], dtype=np.float64))))
-
-    def _arc_weights(self, size: int) -> NDArray[np.float64]:
-        return np.concatenate(
-            (
-                np.full(size - 1, 1.0 / float(self.config.q_scale) ** 2, dtype=np.float64),
-                np.array([1.0 / float(self.config.omega_scale) ** 2], dtype=np.float64),
-            )
-        )
-
-    def _weighted_constraint_row(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._arc_weights(tangent.size) * tangent
-
-    def _weighted_inner(self, left: NDArray[np.float64], right: NDArray[np.float64]) -> float:
-        return float(left @ (self._arc_weights(left.size) * right))
-
-    def _weighted_normalize(self, vector: NDArray[np.float64]) -> NDArray[np.float64]:
-        norm = np.sqrt(self._weighted_inner(vector, vector))
-        if norm == 0.0:
-            raise np.linalg.LinAlgError("arc tangent has zero weighted norm")
-        return vector / norm
 
     def _run_full(
         self,
@@ -377,9 +359,7 @@ class ContinuationSolver:
             coeff_line = flatten_coefficients(initial)
         elif initial.ndim == 1:
             if initial.size != expected_size:
-                raise ValueError(
-                    f"initial_coefficients must have length {expected_size}, got {initial.size}"
-                )
+                raise ValueError(f"initial_coefficients must have length {expected_size}, got {initial.size}")
             coeff_line = initial.reshape(-1)
         else:
             raise ValueError(
@@ -388,20 +368,23 @@ class ContinuationSolver:
             )
 
         parameter = float(config.init_omega if initial_parameter is None else initial_parameter)
-        coeff_line, coeff, nonlinear, jacobian, initial_log = self._solve_initial(coeff_line, parameter)
+        coeff_line, coeff, nonlinear, jacobian, powered, initial_log = self._solve_initial(coeff_line, parameter)
         self._emit_progress(
             "Initial computation, "
             f"Epoch = {initial_log.epoch}, RelRes = {initial_log.relative_residual:.6e}, "
             f"MaxRes = {initial_log.max_residual:.6e}, "
             f"Delta = {initial_log.max_delta:.6e}, Omega = {initial_log.omega:.10g}"
         )
-        j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter)
-        tangent = self._initial_tangent(jacobian, j_parameter)
         y0 = np.concatenate((coeff_line, np.array([parameter], dtype=np.float64)))
 
         parameter_history: list[float] = [float(parameter)] if initial_log.converged else []
         coefficient_history: list[NDArray[np.float64]] = [coeff.copy()] if initial_log.converged else []
         logs: list[StepLog] = []
+        if not initial_log.converged or config.max_steps == 0:
+            return self._build_result(y0, coefficient_history, parameter_history, logs, initial_log)
+
+        j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter, powered)
+        tangent = self._initial_tangent(jacobian, j_parameter)
         arc_length_step = float(config.s_initial)
         shrink_count = 0
 
@@ -415,36 +398,63 @@ class ContinuationSolver:
                 residual_stats = _ResidualStats(np.inf, np.inf)
                 delta = np.full(self.model.n_dof * order + 1, np.inf, dtype=np.float64)
                 arc_solve = None
+                nonfinite_trial = not _array_is_finite(y)
 
                 while (
-                    epoch < config.max_epoch
+                    not nonfinite_trial
+                    and epoch < config.max_epoch
                     and residual_stats.relative_residual >= config.res_tolerance
                     and np.max(np.abs(delta)) >= config.delta_tolerance
                 ):
+                    if not _array_is_finite(coeff_line) or not np.isfinite(parameter):
+                        nonfinite_trial = True
+                        break
                     coeff = self._coefficient_matrix(coeff_line)
                     nonlinear = self._evaluate_nonlinear(coeff, parameter, include_parameter=True)
-                    jacobian = self._jacobian(nonlinear, parameter)
-                    residual_terms = self._residual_terms(coeff_line, nonlinear, parameter)
+                    if not _nonlinear_evaluation_is_finite(nonlinear):
+                        nonfinite_trial = True
+                        break
+                    powered = self.prepared.evaluate_powered(parameter, derivative=True)
+                    jacobian = self._jacobian(nonlinear, parameter, powered)
+                    if not _sparse_is_finite(jacobian):
+                        nonfinite_trial = True
+                        break
+                    residual_terms = self._residual_terms(coeff_line, nonlinear, parameter, powered)
                     residual_vector = residual_terms[0]
+                    if not all(_array_is_finite(term) for term in residual_terms):
+                        residual_stats = _ResidualStats(np.inf, np.inf)
+                        nonfinite_trial = True
+                        break
                     residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-                    j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter)
-                    arc_residual = self._weighted_inner(y - y0, tangent) - arc_length_step
+                    j_parameter = self._parameter_jacobian(coeff_line, nonlinear, parameter, powered)
+                    arc_residual = self._arc_metric.inner(y - y0, tangent) - arc_length_step
+                    if not _array_is_finite(j_parameter) or not np.isfinite(arc_residual):
+                        nonfinite_trial = True
+                        break
                     arc_solve = _solve_one_parameter_bordered_arc(
                         jacobian,
                         j_parameter,
-                        self._weighted_constraint_row(tangent),
+                        self._arc_metric.constraint_row(tangent),
                         residual_vector,
                         arc_residual,
                     )
                     delta = arc_solve.delta
+                    if not _array_is_finite(delta) or not _array_is_finite(arc_solve.tangent_candidate):
+                        nonfinite_trial = True
+                        break
                     y = y - delta
                     coeff_line = y[:-1].copy()
                     parameter = float(y[-1])
                     epoch += 1
 
-                max_delta = float(np.max(np.abs(delta)))
-                converged = residual_stats.relative_residual <= config.res_tolerance or max_delta <= config.delta_tolerance
-                parameter_step = abs(float(parameter) - float(y0[-1]))
+                max_delta = float(np.max(np.abs(delta))) if _array_is_finite(delta) else np.inf
+                converged = bool(
+                    not nonfinite_trial
+                    and (
+                        residual_stats.relative_residual <= config.res_tolerance or max_delta <= config.delta_tolerance
+                    )
+                )
+                parameter_step = abs(float(parameter) - float(y0[-1])) if np.isfinite(parameter) else np.inf
                 raw_parameter_step_too_large = _parameter_step_too_large(config.max_parameter_step, parameter_step)
                 parameter_step_too_large = bool(converged and raw_parameter_step_too_large)
                 accepted = bool(converged and not parameter_step_too_large)
@@ -476,7 +486,7 @@ class ContinuationSolver:
                     y0 = y.copy()
                     if arc_solve is None:
                         raise RuntimeError("converged before assembling arc Jacobian")
-                    tangent = self._weighted_normalize(arc_solve.tangent_candidate)
+                    tangent = self._arc_metric.normalize(arc_solve.tangent_candidate)
                     coeff = self._coefficient_matrix(coeff_line)
                     parameter_history.append(float(parameter))
                     coefficient_history.append(coeff.copy())
@@ -486,10 +496,12 @@ class ContinuationSolver:
 
                 shrink_count += 1
                 if parameter_step_too_large:
+                    if config.max_parameter_step is None:
+                        raise RuntimeError("max_parameter_step is required for parameter-step shrinking")
                     arc_length_step = _shrink_arc_length_for_parameter_step(
                         arc_length_step,
                         parameter_step,
-                        float(config.max_parameter_step),
+                        config.max_parameter_step,
                         config.parameter_step_safety,
                         config.s_min,
                     )
@@ -497,7 +509,7 @@ class ContinuationSolver:
                         break
                     continue
 
-                if epoch >= config.max_epoch:
+                if nonfinite_trial or epoch >= config.max_epoch:
                     arc_length_step = max(0.5 * arc_length_step, config.s_min)
                 else:
                     arc_length_step = min(2.0 * arc_length_step, config.s_max)
@@ -506,6 +518,16 @@ class ContinuationSolver:
             if shrink_count >= config.shrink_limit:
                 break
 
+        return self._build_result(y0, coefficient_history, parameter_history, logs, initial_log)
+
+    def _build_result(
+        self,
+        y0: NDArray[np.float64],
+        coefficient_history: list[NDArray[np.float64]],
+        parameter_history: list[float],
+        logs: list[StepLog],
+        initial_log: StepLog,
+    ) -> ContinuationResult:
         final_coeff = self._coefficient_matrix(y0[:-1])
         final_parameter = float(y0[-1])
         coefficient_history_array = (
@@ -535,3 +557,17 @@ class ContinuationSolver:
         """Run initial Newton solve followed by arc-length continuation."""
 
         return self._run_full(initial_coefficients, initial_parameter)
+
+
+def _validate_initial_direction(value: str) -> None:
+    if value not in {"up", "down"}:
+        raise ValueError("initial_direction must be 'up' or 'down'")
+
+
+def _validate_continuation_config(config: ContinuationConfig) -> None:
+    _validate_initial_direction(config.initial_direction)
+    _validate_positive_scale("q_scale", config.q_scale)
+    _validate_positive_scale("omega_scale", config.omega_scale)
+    _validate_optional_positive_scale("max_parameter_step", config.max_parameter_step)
+    _validate_positive_scale("parameter_step_safety", config.parameter_step_safety)
+    _validate_positive_scale("residual_floor", config.residual_floor)

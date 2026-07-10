@@ -11,11 +11,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import FloquetConfig, compute_floquet
-from pyhb.harmonics import generate_hb_items
 from examples.bernoulli_beam.model import BernoulliBeamModel
 from examples.bernoulli_beam.run_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
-
+from pyhb import FloquetConfig, compute_floquet
+from pyhb.harmonics import generate_hb_items
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
 DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "arc.png"
@@ -99,7 +98,9 @@ def compute_stability_history(
     ):
         result = compute_floquet(model, coefficients, float(parameter), HARMONICS, FREQUENCY_RESOLUTION, config)
         status = "stable" if result.stable else "unstable"
-        print(f"Floquet {index}/{total} done, omega={float(parameter):.10g}, rho={result.spectral_radius:.6e}, {status}")
+        print(
+            f"Floquet {index}/{total} done, omega={float(parameter):.10g}, rho={result.spectral_radius:.6e}, {status}"
+        )
         spectral_radius.append(result.spectral_radius)
         stable.append(result.stable)
         multipliers.append(result.multipliers)

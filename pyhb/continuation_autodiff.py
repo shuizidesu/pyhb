@@ -17,7 +17,7 @@ from .autodiff_utils import (
     _to_numpy,
     _validate_autodiff_variables,
 )
-from .continuation import _NonlinearEvaluation, ContinuationConfig, ContinuationSolver
+from .continuation import ContinuationConfig, ContinuationSolver, _NonlinearEvaluation
 from .continuation_core import _local_samples_to_global_coefficients, _validated_dofs
 from .harmonics import coefficient_matrix_from_fft
 from .models import AutodiffSecondOrderTimeModel, JacobianVariable
@@ -52,6 +52,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
         self.config: ContinuationAutodiffConfig
         self._torch_device = _resolve_torch_device(self.config.torch_device)
         self._autodiff_variables = _validate_autodiff_variables(self.model.autodiff_variables)
+        self._t_tensor = _as_torch(self.prepared.t, self._torch_device)
 
     def _evaluate_nonlinear(
         self,
@@ -113,10 +114,10 @@ class ContinuationAutodiffSolver(ContinuationSolver):
         if not jacobian_by_variable:
             return sparse.csc_matrix((size, size), dtype=np.float64)
 
-        tensor_by_variable = {
-            "x": context.s3_tensor_x,
-            "dx": context.s3_tensor_dx,
-            "ddx": context.s3_tensor_ddx,
+        s3_by_variable = {
+            "x": context.s3,
+            "dx": context.s3_dx,
+            "ddx": context.s3_ddx,
         }
         force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
         coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
@@ -124,8 +125,8 @@ class ContinuationAutodiffSolver(ContinuationSolver):
         coordinate_count = coordinate_dofs_array.size
         force_columns = np.repeat(force_dofs_array, coordinate_count)
         coordinate_columns = np.tile(coordinate_dofs_array, force_count)
-        row_offsets = np.arange(order, dtype=np.int64)
-        col_offsets = np.arange(order, dtype=np.int64)
+        local_rows = np.tile(np.arange(order, dtype=np.int64), order)
+        local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
 
         row_chunks: list[NDArray[np.int64]] = []
         col_chunks: list[NDArray[np.int64]] = []
@@ -139,13 +140,12 @@ class ContinuationAutodiffSolver(ContinuationSolver):
                 context.sample_count,
                 context.nonlinear_harmonic_indices,
             )
-            blocks = np.einsum("abk,kt->abt", tensor_by_variable[variable], coeffs)
-            term_blocks = np.moveaxis(blocks, 2, 0)
-            row_indices = force_columns[:, None, None] * order + row_offsets[None, :, None]
-            col_indices = coordinate_columns[:, None, None] * order + col_offsets[None, None, :]
-            row_chunks.append(np.broadcast_to(row_indices, term_blocks.shape).reshape(-1))
-            col_chunks.append(np.broadcast_to(col_indices, term_blocks.shape).reshape(-1))
-            data_chunks.append(term_blocks.reshape(-1))
+            term_blocks_flat = (s3_by_variable[variable] @ coeffs).T
+            row_indices = force_columns[:, None] * order + local_rows[None, :]
+            col_indices = coordinate_columns[:, None] * order + local_cols[None, :]
+            row_chunks.append(row_indices.reshape(-1))
+            col_chunks.append(col_indices.reshape(-1))
+            data_chunks.append(term_blocks_flat.reshape(-1))
 
         rows = np.concatenate(row_chunks)
         cols = np.concatenate(col_chunks)
@@ -166,7 +166,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
         expected_force_shape = (self.prepared.t.size, force_count)
         expected_coordinate_shape = (self.prepared.t.size, coordinate_count)
 
-        t_tensor = _as_torch(self.prepared.t, self._torch_device)
+        t_tensor = self._t_tensor
         x_tensor = _as_torch(local_x, self._torch_device)
         dx_tensor = _as_torch(local_dx, self._torch_device)
         ddx_tensor = _as_torch(local_ddx, self._torch_device)
@@ -193,9 +193,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
             jacobian = _to_numpy(jacobian_tensor)
             expected_jacobian_shape = (self.prepared.t.size, force_count, coordinate_count)
             if jacobian.shape != expected_jacobian_shape:
-                raise ValueError(
-                    f"dN/d{variable} must have shape {expected_jacobian_shape}, got {jacobian.shape}"
-                )
+                raise ValueError(f"dN/d{variable} must have shape {expected_jacobian_shape}, got {jacobian.shape}")
             jacobian_by_variable[variable] = jacobian
 
         if include_parameter and self.model.autodiff_parameter_dependent:

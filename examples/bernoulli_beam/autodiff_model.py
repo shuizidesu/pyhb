@@ -10,7 +10,6 @@ from scipy.io import loadmat
 
 from pyhb import AutodiffSecondOrderTimeModel, ForcingTerm, LinearOperatorTerm
 
-
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "beam_parameter_matrix.mat"
 
 
@@ -85,8 +84,7 @@ class BernoulliBeamAutodiffModel(AutodiffSecondOrderTimeModel):
     ) -> torch.Tensor:
         displacement = local_x[:, 0]
         velocity = local_dx[:, 0]
-        nonlinear_force = (
-            float(self.parameters.kappa) * displacement.pow(3)
-            + float(self.parameters.gamma) * parameter.pow(3) * velocity.pow(3)
-        )
+        nonlinear_force = float(self.parameters.kappa) * displacement.pow(3) + float(
+            self.parameters.gamma
+        ) * parameter.pow(3) * velocity.pow(3)
         return nonlinear_force.reshape(-1, 1)

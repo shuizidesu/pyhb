@@ -11,13 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import ContinuationConfig, ContinuationResult, ContinuationSolver
 from examples.bilinear_hysteretic.model import BilinearHystereticModel
-
+from pyhb import ContinuationConfig, ContinuationResult, ContinuationSolver
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
 DEFAULT_MAX_STEPS = 300
-DEFAULT_SAMPLE_FFT = 2 ** 11
+DEFAULT_SAMPLE_FFT = 2**11
 FREQUENCY_RESOLUTION = 1.0
 INIT_OMEGA = 2.0
 MAX_EPOCH = 30

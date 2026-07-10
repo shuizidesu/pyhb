@@ -1,17 +1,19 @@
 """Generic pyHB harmonic-balance tools for nonlinear dynamics."""
 
+from importlib import import_module
+
 from .continuation import ContinuationConfig, ContinuationResult, ContinuationSolver
-from .floquet import FloquetConfig, FloquetResult, compute_floquet, compute_free_frequency_floquet
 from .continuation_free_frequency import (
     ContinuationFreeFrequencyConfig,
     ContinuationFreeFrequencyResult,
     ContinuationFreeFrequencySolver,
     ContinuationFreeFrequencyStepLog,
 )
-from .hb_operators import FrequencyGrid, build_full_fft_nonlinear_harmonics
+from .floquet import FloquetConfig, FloquetResult, compute_floquet, compute_free_frequency_floquet
+from .hb_operators import FrequencyGrid
 from .models import (
-    AutodiffSecondOrderTimeModel,
     AutodiffFreeFrequencySecondOrderTimeModel,
+    AutodiffSecondOrderTimeModel,
     ForcingTerm,
     FreeFrequencySecondOrderTimeModel,
     HarmonicCoefficientConstraint,
@@ -23,13 +25,28 @@ from .models import (
     SecondOrderTimeModel,
 )
 
+__version__ = "0.1.0"
+
 _AUTODIFF_EXPORTS = {
-    "ContinuationAutodiffConfig",
-    "ContinuationAutodiffSolver",
-    "ContinuationFreeFrequencyAutodiffConfig",
-    "ContinuationFreeFrequencyAutodiffSolver",
-    "compute_free_frequency_floquet_autodiff",
-    "compute_floquet_autodiff",
+    "ContinuationAutodiffConfig": ("continuation_autodiff", "ContinuationAutodiffConfig"),
+    "ContinuationAutodiffSolver": ("continuation_autodiff", "ContinuationAutodiffSolver"),
+    "ContinuationFreeFrequencyAutodiffConfig": (
+        "continuation_free_frequency_autodiff",
+        "ContinuationFreeFrequencyAutodiffConfig",
+    ),
+    "ContinuationFreeFrequencyAutodiffSolver": (
+        "continuation_free_frequency_autodiff",
+        "ContinuationFreeFrequencyAutodiffSolver",
+    ),
+    "compute_free_frequency_floquet_autodiff": (
+        "floquet_autodiff",
+        "compute_free_frequency_floquet_autodiff",
+    ),
+    "compute_floquet_autodiff": ("floquet_autodiff", "compute_floquet_autodiff"),
+    "compute_mixed_order_floquet_autodiff": (
+        "floquet_mixed_autodiff",
+        "compute_mixed_order_floquet_autodiff",
+    ),
 }
 
 __all__ = [
@@ -53,8 +70,8 @@ __all__ = [
     "HarmonicCoefficientConstraint",
     "ReferencePhaseCondition",
     "SecondOrderTimeModel",
+    "__version__",
     "AutodiffFreeFrequencySecondOrderTimeModel",
-    "build_full_fft_nonlinear_harmonics",
     "compute_free_frequency_floquet",
     "compute_floquet",
 ]
@@ -62,20 +79,12 @@ __all__ = [
 
 def __getattr__(name: str):
     if name in _AUTODIFF_EXPORTS:
-        from .continuation_autodiff import ContinuationAutodiffConfig, ContinuationAutodiffSolver
-        from .floquet_autodiff import compute_floquet_autodiff, compute_free_frequency_floquet_autodiff
-        from .continuation_free_frequency_autodiff import (
-            ContinuationFreeFrequencyAutodiffConfig,
-            ContinuationFreeFrequencyAutodiffSolver,
-        )
-
-        values = {
-            "ContinuationAutodiffConfig": ContinuationAutodiffConfig,
-            "ContinuationAutodiffSolver": ContinuationAutodiffSolver,
-            "ContinuationFreeFrequencyAutodiffConfig": ContinuationFreeFrequencyAutodiffConfig,
-            "ContinuationFreeFrequencyAutodiffSolver": ContinuationFreeFrequencyAutodiffSolver,
-            "compute_free_frequency_floquet_autodiff": compute_free_frequency_floquet_autodiff,
-            "compute_floquet_autodiff": compute_floquet_autodiff,
-        }
-        return values[name]
+        module_name, attribute_name = _AUTODIFF_EXPORTS[name]
+        value = getattr(import_module(f".{module_name}", __name__), attribute_name)
+        globals()[name] = value
+        return value
     raise AttributeError(f"module 'pyhb' has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_AUTODIFF_EXPORTS))

@@ -11,9 +11,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from examples.machine_absorber.autodiff_model import MachineAbsorberAutodiffModel
-from examples.machine_absorber.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
-from pyhb import FloquetConfig, compute_floquet_autodiff
+from examples.piezoelectric_magnetic_harvester.autodiff_model import (
+    PiezoelectricMagneticHarvesterAutodiffModel,
+)
+from examples.piezoelectric_magnetic_harvester.run_autodiff_arc import (
+    DEFAULT_PLOT_DOFS,
+    FREQUENCY_RESOLUTION,
+    HARMONICS,
+)
+from pyhb import FloquetConfig, compute_mixed_order_floquet_autodiff
 from pyhb.harmonics import generate_hb_items
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
@@ -21,10 +27,14 @@ DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "autodiff_arc
 DEFAULT_OUTPUT_RMS = Path(__file__).resolve().parent / "results" / "autodiff_arc_rms.npz"
 DEFAULT_OUTPUT_FLOQUET = Path(__file__).resolve().parent / "results" / "autodiff_arc_floquet.npz"
 DEFAULT_SAMPLE_COUNT = 2048
+SECOND_ORDER_DOFS = (0, 1)
+FIRST_ORDER_DOFS = (2,)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Postprocess the machine-absorber autodiff continuation result.")
+    parser = argparse.ArgumentParser(
+        description="Postprocess the piezoelectric magnetic harvester autodiff continuation result."
+    )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FIG)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
@@ -62,13 +72,21 @@ def save_plot(
     import matplotlib.pyplot as plt
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots()
-    for column, dof in enumerate(dofs):
-        _plot_curve(ax, parameter_history, rms_history[:, column], f"DOF {dof + 1}", stable_history)
-    ax.set_xlabel("omega")
-    ax.set_ylabel("RMS amplitude")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    fig, axes = plt.subplots(len(dofs), 1, sharex=True, figsize=(6.4, 3.0 * len(dofs)))
+    axes_array = np.atleast_1d(axes)
+    for axis, column, dof in zip(axes_array, range(len(dofs)), dofs, strict=True):
+        values = rms_history[:, column]
+        if dof == 1:
+            values = values * 1e3
+            ylabel = "z2 RMS [mm]"
+        elif dof == 2:
+            ylabel = "u RMS [V]"
+        else:
+            ylabel = f"DOF {dof + 1} RMS"
+        _plot_curve(axis, parameter_history, values, ylabel, stable_history)
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=0.3)
+    axes_array[-1].set_xlabel("omega")
     fig.tight_layout()
     fig.savefig(output, dpi=160)
     plt.close(fig)
@@ -83,7 +101,7 @@ def compute_stability_history(
     stability_tolerance: float,
     torch_device: str | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.complex128]]:
-    model = MachineAbsorberAutodiffModel()
+    model = PiezoelectricMagneticHarvesterAutodiffModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
         method=floquet_method,
@@ -98,12 +116,14 @@ def compute_stability_history(
         zip(parameter_history, coefficient_history, strict=True),
         start=1,
     ):
-        result = compute_floquet_autodiff(
+        result = compute_mixed_order_floquet_autodiff(
             model,
             coefficients,
             float(parameter),
             HARMONICS,
             FREQUENCY_RESOLUTION,
+            SECOND_ORDER_DOFS,
+            FIRST_ORDER_DOFS,
             config,
             torch_device=torch_device,
         )
@@ -129,13 +149,12 @@ def _plot_curve(
     stable_history: NDArray[np.bool_] | None,
 ) -> None:
     if stable_history is None or stable_history.size != x.size:
-        ax.plot(x, y, label=label)
+        ax.plot(x, y)
         return
     (handle,) = ax.plot([], [], label=label)
     color = handle.get_color()
     handle.remove()
     start = 0
-    first = True
     for index in range(1, x.size + 1):
         if index == x.size or bool(stable_history[index]) != bool(stable_history[start]):
             segment = slice(start, index)
@@ -145,9 +164,7 @@ def _plot_curve(
                 color=color,
                 linestyle="-" if bool(stable_history[start]) else "--",
                 marker="." if index - start == 1 else None,
-                label=label if first else None,
             )
-            first = False
             start = index
 
 
@@ -165,7 +182,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             parameter_history,
             coefficient_history,
             getattr(args, "hsu_samples", 512),
-            getattr(args, "floquet_method", "trapezoid"),
+            getattr(args, "floquet_method", "exponential"),
             getattr(args, "stability_tolerance", 1e-4),
             getattr(args, "torch_device", None),
         )

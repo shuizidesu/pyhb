@@ -2,6 +2,9 @@
 
 pyHB provides generic harmonic-balance and arc-length continuation utilities for nonlinear dynamic response analysis.
 
+The project is licensed under the BSD 3-Clause License. The current package
+version is available as `pyhb.__version__`.
+
 The reusable library code lives in `pyhb`. System-specific models and runnable scripts live in `examples`.
 
 ## Install
@@ -19,6 +22,9 @@ pip install .[examples]
 pip install .[autodiff]
 pip install .[dev]
 ```
+
+The `dev` extra provides Ruff, Mypy, and distribution build tooling. The full
+local regression additionally requires the `examples` and `autodiff` extras.
 
 The core package depends only on NumPy and SciPy. Torch is optional and is loaded only when autodiff solvers or autodiff Floquet helpers are used.
 
@@ -42,6 +48,8 @@ The main solver and postprocessing entry points are:
 - `compute_floquet_autodiff` for Torch autodiff Floquet stability postprocessing.
 - `compute_free_frequency_floquet` and `compute_free_frequency_floquet_autodiff` for free-frequency
   Floquet stability postprocessing.
+- `compute_mixed_order_floquet_autodiff` for systems combining second- and
+  first-order coordinates.
 
 ## Minimal Use
 

@@ -35,8 +35,7 @@ Most users start from objects exported by `pyhb.__init__`:
   `ContinuationFreeFrequencyAutodiffSolver` run harmonic-balance continuation.
 - `compute_floquet`, `compute_free_frequency_floquet`, and their autodiff
   counterparts compute Floquet multipliers for accepted HB solutions.
-- `FrequencyGrid` and `build_full_fft_nonlinear_harmonics` expose the frequency
-  grid tools that users commonly need when configuring solvers.
+- `FrequencyGrid` exposes the frequency-grid checks used by the solvers.
 
 Lower-level modules provide the assembly building blocks used by the solvers:
 
@@ -44,8 +43,11 @@ Lower-level modules provide the assembly building blocks used by the solvers:
   Jacobian terms, DOF validation, and local-to-global nonlinear scattering.
 - `pyhb.harmonics` defines the HB basis order and FFT projection helpers.
 - `pyhb.hb_operators` builds reusable HB metadata: frequency grids, derivative
-  maps, linear projection matrices, and the S3 tensors used for nonlinear
+  maps, linear projection matrices, and the flattened S3 operators used for nonlinear
   Jacobian projection.
+- `pyhb.continuation_core` orchestrates shared continuation preparation and
+  provides powered-block, arc-metric, Jacobian-assembly, and bordered-solve
+  utilities. HB operator construction remains in `pyhb.hb_operators`.
 - `pyhb.continuation` assembles the full analytical residual and Newton
   correction matrix, then runs weighted arc-length continuation.
 - `pyhb.continuation_autodiff` reuses the full continuation loop but obtains
@@ -58,13 +60,15 @@ Lower-level modules provide the assembly building blocks used by the solvers:
   Jacobians in time, and computes monodromy multipliers.
 - `pyhb.floquet_autodiff` uses Torch autodiff to build the same sampled
   nonlinear Jacobians before calling the shared Floquet backend.
+- `pyhb.floquet_mixed_autodiff` handles mixed second-/first-order descriptor
+  systems whose mass matrix is singular in the original coordinate layout.
 
 The typical data flow is:
 
 ```text
 model samples
   -> HB/FFT projection
-  -> precomputed frequency grid, basis blocks, and S3 tensors
+  -> precomputed frequency grid, basis blocks, and flattened S3 matrices
   -> residual and Newton correction matrix
   -> continuation history
   -> optional Floquet postprocessing
@@ -94,7 +98,7 @@ Useful helpers in `pyhb.harmonics`:
 - `stack_fft_coefficients(sample_by_dof, harmonics, ...)` projects sampled
   residual-like arrays into stacked HB coefficients.
 - `coefficient_matrix_from_fft(values, harmonics, ...)` projects sampled
-  nonlinear Jacobian entries into a coefficient matrix used with S3 tensors.
+  nonlinear Jacobian entries into a coefficient matrix used with S3 operators.
 
 The residual projection and nonlinear-Jacobian projection have different DC
 conventions internally. Users normally do not need to manage this manually;
@@ -125,9 +129,11 @@ Parameters:
 
 `period` is `2*pi/frequency_resolution`.
 
-`build_full_fft_nonlinear_harmonics(sample_count, frequency_resolution)` returns
-all positive FFT-bin harmonics through Nyquist. This is the default nonlinear
-projection grid when a solver config leaves `nonlinear_harmonics=None`.
+Continuation solvers choose the nonlinear Jacobian projection grid internally.
+For response harmonics with maximum FFT-bin index `hmax`, the nonlinear
+projection harmonics are the positive bins through `2*hmax`. Higher S3 columns
+are theoretically zero because products of retained HB basis functions cannot
+exceed the sum of two retained harmonic frequencies.
 
 ### HBContext
 
@@ -136,11 +142,11 @@ directly by end users, but it explains what is precomputed before Newton
 iterations begin:
 
 - validated response harmonics and their FFT bin indices;
-- validated nonlinear projection harmonics and their FFT bin indices;
+- solver-generated nonlinear projection harmonics and their FFT bin indices;
 - the fundamental period and sample count;
 - `order = 2*len(harmonics) + 1`;
-- the raw S3 matrix;
-- `s3_tensor_x`, `s3_tensor_dx`, and `s3_tensor_ddx`.
+- the S3 projection matrix for `x` derivatives;
+- the derivative S3 projection matrices `s3_dx` and `s3_ddx`.
 
 The continuation solvers keep this context in their prepared problem objects.
 The autodiff continuation solvers use the same context; only the source of
@@ -160,14 +166,21 @@ linear block in coefficient space.
 
 `coefficient_derivative_maps(harmonics)` returns two coefficient maps. They
 convert a coefficient vector into the corresponding first- and second-derivative
-basis contribution. These maps are also used to convert the base S3 tensor into
-the derivative tensors for `dx` and `ddx` nonlinear Jacobian terms.
+basis contribution. These maps are also used to convert the base S3 projection
+matrix into the derivative projection matrices for `dx` and `ddx` nonlinear
+Jacobian terms.
 
 ### S3 Construction
 
-The S3 tensor is the common projection tensor for nonlinear Jacobians. It couples
+The S3 matrix is the common projection operator for nonlinear Jacobians. It couples
 one residual test basis function, one response basis function, and one nonlinear
-Jacobian Fourier basis function.
+Jacobian Fourier basis function. It is stored as a two-dimensional matrix with
+shape `(order*order, nonlinear_order)`.
+
+Mathematically this is an `(order, order, nonlinear_order)` tensor. `s3`,
+`s3_dx`, and `s3_ddx` all use the same flattened shape and Fortran ordering.
+The derivative variants are formed by tensor contraction with the coefficient
+derivative maps; no `(order*order, order*order)` Kronecker matrix is constructed.
 
 `compute_s3(...)` selects the implementation:
 
@@ -176,14 +189,16 @@ Jacobian Fourier basis function.
 - `integrate_s3(...)` uses numerical quadrature and is selected by
   `s3_method="quad"`.
 
-After S3 is computed, `s3_to_tensor(...)` reshapes it into
-`(order, order, nonlinear_order)`. `HBContext.build(...)` then constructs:
+After S3 is computed, `HBContext.build(...)` constructs:
 
-- `s3_tensor_x`: used for derivatives of nonlinear force with respect to `x`;
-- `s3_tensor_dx`: used for derivatives with respect to `dx`;
-- `s3_tensor_ddx`: used for derivatives with respect to `ddx`.
+- `s3`: used for derivatives of nonlinear force with respect to `x`;
+- `s3_dx`: used for derivatives with respect to `dx`;
+- `s3_ddx`: used for derivatives with respect to `ddx`.
 
-These tensors are precomputed once for the configured harmonic grid.
+These matrices are precomputed once for the configured harmonic grid. Runtime
+nonlinear Jacobian assembly multiplies the selected S3 matrix by the Fourier
+coefficients of local derivative samples, then scatters the flattened local HB
+blocks into the global sparse Jacobian.
 
 ## Model Interface
 
@@ -313,8 +328,6 @@ result = solver.run(initial_coefficients=initial)
 
 - `sample_fft`: number of strict FFT time samples.
 - `harmonics`: retained response harmonics.
-- `nonlinear_harmonics`: nonlinear projection harmonics. If `None`, all
-  positive FFT bins through Nyquist are used.
 - `frequency_resolution` and `frequency_tolerance`: harmonic-to-FFT-bin
   alignment.
 - `s3_method`: `"fast"` for periodic-grid projection or `"quad"` for numerical
@@ -337,7 +350,7 @@ coefficients shaped `(order, n_dof)` or an equivalent flattened vector.
 
 `ContinuationResult` contains:
 
-- `coefficients`: final accepted flattened coefficient vector.
+- `coefficients`: final accepted coefficient matrix shaped `(order, n_dof)`.
 - `omega`: final continuation parameter.
 - `coefficient_history`: accepted coefficient history.
 - `parameter_history`: accepted parameter history.
@@ -350,7 +363,7 @@ The full solver assembles:
   terms;
 - a linear correction block from precomputed structured operator blocks;
 - a nonlinear correction block from model Jacobian samples, FFT coefficients,
-  and S3 tensors;
+  and S3 operators;
 - a parameter column from forcing, nonlinear parameter derivative, and linear
   parameter derivative terms.
 
@@ -375,7 +388,7 @@ result = ContinuationAutodiffSolver(model, config).run(initial_coefficients)
 - `torch_device`: optional Torch device selector such as `"cpu"` or `"cuda"`.
   `None` uses CUDA when available, otherwise CPU.
 
-The continuation loop, residual definition, linear assembly, S3 tensors, and
+The continuation loop, residual definition, linear assembly, S3 operators, and
 result object match the full analytical solver. Only the nonlinear derivative
 generation path is replaced by Torch autodiff.
 
@@ -403,7 +416,7 @@ Required free-frequency model metadata:
 - `residual_coordinate_dofs`: global coordinates whose `x/dx/ddx` enter `G`.
 - `local_residual_force(...)`: local samples of `G`.
 - `local_residual_jacobian_terms(...)`: local samples of `dG/dx`,
-  `dG/ddx`, and `dG/dddx`.
+  `dG/d(dx)`, and `dG/d(ddx)`.
 
 Optional derivatives default to zero:
 
@@ -415,14 +428,17 @@ Optional derivatives default to zero:
 - `init_parameter`: initial value of the true continuation parameter.
 - `parameter_scale`: weighted arc-length scale for the true continuation
   parameter.
-- `constraint`: a `HarmonicCoefficientConstraint` fixing one HB coefficient to
-  remove phase ambiguity.
+- `initial_constraint`: a fixed `HarmonicCoefficientConstraint` used for the
+  preliminary Newton solve.
+- `phase_condition`: a `ReferencePhaseCondition` by default, or an optional
+  fixed `HarmonicCoefficientConstraint`, used during continuation.
+- `constraint`: a compatibility alias for a fixed constraint configuration.
 - `constraint_tolerance`: convergence tolerance for that constraint.
 
 The preliminary Newton solve uses unknowns `[q, omega]` at fixed `parameter`.
-Arc-length continuation uses `[q, omega, parameter]`. The constraint row is
-assembled by the solver and contains a single `1` at the constrained coefficient
-column.
+Arc-length continuation uses `[q, omega, parameter]`. The preliminary constraint
+row contains a single `1`; the default continuation phase row is generated from
+the previous accepted reference solution.
 
 `ContinuationFreeFrequencyResult` stores:
 
@@ -495,6 +511,10 @@ evaluated with `(omega, parameter)`.
 
 After this point both paths call the same monodromy routines. Torch is imported
 only by the autodiff path.
+
+The trapezoid backend factors and applies one sampled step at a time, updating
+the dense monodromy immediately so LU factorizations are not retained for the
+whole period.
 
 ## Examples
 

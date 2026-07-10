@@ -11,25 +11,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from examples.machine_absorber.autodiff_model import MachineAbsorberAutodiffModel
-from examples.machine_absorber.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
-from pyhb import FloquetConfig, compute_floquet_autodiff
+from examples.piezoelectric_bistable_beam.autodiff_model import PiezoelectricBistableBeamAutodiffModel
+from examples.piezoelectric_bistable_beam.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RESOLUTION, HARMONICS
+from pyhb import FloquetConfig, compute_mixed_order_floquet_autodiff
 from pyhb.harmonics import generate_hb_items
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
 DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
-DEFAULT_OUTPUT_RMS = Path(__file__).resolve().parent / "results" / "autodiff_arc_rms.npz"
+DEFAULT_OUTPUT_MAX = Path(__file__).resolve().parent / "results" / "autodiff_arc_max.npz"
 DEFAULT_OUTPUT_FLOQUET = Path(__file__).resolve().parent / "results" / "autodiff_arc_floquet.npz"
 DEFAULT_SAMPLE_COUNT = 2048
+SECOND_ORDER_DOFS = (0,)
+FIRST_ORDER_DOFS = (1,)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Postprocess the machine-absorber autodiff continuation result.")
+    parser = argparse.ArgumentParser(description="Postprocess the bistable piezoelectric beam autodiff result.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FIG)
     parser.add_argument("--sample-count", type=int, default=DEFAULT_SAMPLE_COUNT)
     parser.add_argument("--dofs", type=int, nargs="+", default=DEFAULT_PLOT_DOFS)
-    parser.add_argument("--rms-output", type=Path, default=DEFAULT_OUTPUT_RMS)
+    parser.add_argument("--max-output", type=Path, default=DEFAULT_OUTPUT_MAX)
     parser.add_argument("--no-stability", action="store_true")
     parser.add_argument("--stability-output", type=Path, default=DEFAULT_OUTPUT_FLOQUET)
     parser.add_argument("--hsu-samples", type=int, default=512)
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def compute_rms_history(
+def compute_max_history(
     coefficient_history: NDArray[np.float64],
     dofs: tuple[int, ...],
     sample_count: int,
@@ -49,12 +51,12 @@ def compute_rms_history(
     hb_item, _, _ = generate_hb_items(t, HARMONICS)
     selected_coefficients = coefficient_history[:, :, list(dofs)]
     response = np.einsum("to,sod->std", hb_item, selected_coefficients)
-    return np.sqrt(np.mean(response * response, axis=1))
+    return np.max(response, axis=1)
 
 
 def save_plot(
     parameter_history: NDArray[np.float64],
-    rms_history: NDArray[np.float64],
+    max_history: NDArray[np.float64],
     dofs: tuple[int, ...],
     output: Path,
     stable_history: NDArray[np.bool_] | None = None,
@@ -62,13 +64,21 @@ def save_plot(
     import matplotlib.pyplot as plt
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots()
-    for column, dof in enumerate(dofs):
-        _plot_curve(ax, parameter_history, rms_history[:, column], f"DOF {dof + 1}", stable_history)
-    ax.set_xlabel("omega")
-    ax.set_ylabel("RMS amplitude")
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    fig, axes = plt.subplots(len(dofs), 1, sharex=True, figsize=(6.4, 3.0 * len(dofs)))
+    axes_array = np.atleast_1d(axes)
+    for axis, column, dof in zip(axes_array, range(len(dofs)), dofs, strict=True):
+        values = max_history[:, column]
+        if dof == 0:
+            values = values * 1e3
+            ylabel = "q max [mm]"
+        elif dof == 1:
+            ylabel = "v max [V]"
+        else:
+            ylabel = f"DOF {dof + 1} max"
+        _plot_curve(axis, parameter_history, values, stable_history)
+        axis.set_ylabel(ylabel)
+        axis.grid(True, alpha=0.3)
+    axes_array[-1].set_xlabel("omega")
     fig.tight_layout()
     fig.savefig(output, dpi=160)
     plt.close(fig)
@@ -83,7 +93,7 @@ def compute_stability_history(
     stability_tolerance: float,
     torch_device: str | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_], NDArray[np.complex128]]:
-    model = MachineAbsorberAutodiffModel()
+    model = PiezoelectricBistableBeamAutodiffModel()
     config = FloquetConfig(
         hsu_samples=hsu_samples,
         method=floquet_method,
@@ -98,12 +108,14 @@ def compute_stability_history(
         zip(parameter_history, coefficient_history, strict=True),
         start=1,
     ):
-        result = compute_floquet_autodiff(
+        result = compute_mixed_order_floquet_autodiff(
             model,
             coefficients,
             float(parameter),
             HARMONICS,
             FREQUENCY_RESOLUTION,
+            SECOND_ORDER_DOFS,
+            FIRST_ORDER_DOFS,
             config,
             torch_device=torch_device,
         )
@@ -125,17 +137,15 @@ def _plot_curve(
     ax,
     x: NDArray[np.float64],
     y: NDArray[np.float64],
-    label: str,
     stable_history: NDArray[np.bool_] | None,
 ) -> None:
     if stable_history is None or stable_history.size != x.size:
-        ax.plot(x, y, label=label)
+        ax.plot(x, y)
         return
-    (handle,) = ax.plot([], [], label=label)
+    (handle,) = ax.plot([], [])
     color = handle.get_color()
     handle.remove()
     start = 0
-    first = True
     for index in range(1, x.size + 1):
         if index == x.size or bool(stable_history[index]) != bool(stable_history[start]):
             segment = slice(start, index)
@@ -145,9 +155,7 @@ def _plot_curve(
                 color=color,
                 linestyle="-" if bool(stable_history[start]) else "--",
                 marker="." if index - start == 1 else None,
-                label=label if first else None,
             )
-            first = False
             start = index
 
 
@@ -156,7 +164,7 @@ def run_from_args(args: argparse.Namespace) -> None:
         parameter_history = np.asarray(data["parameter_history"], dtype=np.float64)
         coefficient_history = np.asarray(data["coefficient_history"], dtype=np.float64)
     dofs = tuple(int(dof) for dof in args.dofs)
-    rms_history = compute_rms_history(coefficient_history, dofs, args.sample_count)
+    max_history = compute_max_history(coefficient_history, dofs, args.sample_count)
     spectral_radius = None
     stable_history = None
     multiplier_history = None
@@ -165,20 +173,20 @@ def run_from_args(args: argparse.Namespace) -> None:
             parameter_history,
             coefficient_history,
             getattr(args, "hsu_samples", 512),
-            getattr(args, "floquet_method", "trapezoid"),
+            getattr(args, "floquet_method", "exponential"),
             getattr(args, "stability_tolerance", 1e-4),
             getattr(args, "torch_device", None),
         )
-    save_plot(parameter_history, rms_history, dofs, args.output, stable_history)
-    if args.rms_output is not None:
-        args.rms_output.parent.mkdir(parents=True, exist_ok=True)
+    save_plot(parameter_history, max_history, dofs, args.output, stable_history)
+    if args.max_output is not None:
+        args.max_output.parent.mkdir(parents=True, exist_ok=True)
         np.savez(
-            args.rms_output,
+            args.max_output,
             omega=parameter_history,
-            rms_history=rms_history,
+            max_history=max_history,
             dofs=np.asarray(dofs, dtype=np.int64),
         )
-        print(f"Saved RMS table to {args.rms_output}")
+        print(f"Saved max table to {args.max_output}")
     stability_output = getattr(args, "stability_output", None)
     if (
         stability_output is not None

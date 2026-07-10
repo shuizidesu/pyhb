@@ -116,4 +116,3 @@ class VanderpolModel(FreeFrequencySecondOrderTimeModel):
         lambda_value = float(self.parameters.lambda_value)
         derivative = -float(omega) * (lambda_value - displacement**2) * velocity
         return derivative.reshape(-1, 1)
-

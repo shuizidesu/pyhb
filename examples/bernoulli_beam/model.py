@@ -9,7 +9,6 @@ from scipy.io import loadmat
 
 from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
 
-
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "beam_parameter_matrix.mat"
 
 

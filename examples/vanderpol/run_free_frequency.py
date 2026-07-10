@@ -11,13 +11,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import ContinuationFreeFrequencyConfig, ContinuationFreeFrequencyResult, ContinuationFreeFrequencySolver, HarmonicCoefficientConstraint
 from examples.vanderpol.model import VanderpolModel
-
+from pyhb import (
+    ContinuationFreeFrequencyConfig,
+    ContinuationFreeFrequencyResult,
+    ContinuationFreeFrequencySolver,
+    HarmonicCoefficientConstraint,
+)
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "free_frequency.npz"
 DEFAULT_MAX_STEPS = 80
-DEFAULT_SAMPLE_FFT = 2 ** 11
+DEFAULT_SAMPLE_FFT = 2**11
 HARMONICS = tuple(float(value) for value in range(1, 51))
 FREQUENCY_RESOLUTION = 1.0
 INIT_OMEGA = 1.0

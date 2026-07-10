@@ -10,8 +10,15 @@ from numpy.typing import NDArray
 from scipy import linalg, sparse
 from scipy.sparse.linalg import splu
 
+from .continuation_core import _StructuredHBModel
 from .harmonics import generate_hb_items
-from .models import FreeFrequencySecondOrderTimeModel, JacobianVariable, SecondOrderTimeModel
+from .models import (
+    FreeFrequencySecondOrderTimeModel,
+    JacobianVariable,
+    LinearOperatorTerm,
+    NonlinearJacobianTerm,
+    SecondOrderTimeModel,
+)
 
 
 @dataclass(frozen=True)
@@ -129,14 +136,8 @@ class _SolutionSamples:
     stiffness: sparse.csc_matrix
 
 
-@dataclass(frozen=True)
-class _HsuStep:
-    left_lu: object
-    right: sparse.csc_matrix
-
-
 def prepare_solution_samples(
-    model: SecondOrderTimeModel,
+    model: _StructuredHBModel,
     coefficients: NDArray[np.float64],
     parameter: float,
     harmonics: Sequence[float],
@@ -156,7 +157,7 @@ def prepare_solution_samples(
 
 
 def compute_floquet_from_sampled_jacobians(
-    model: SecondOrderTimeModel,
+    model: _StructuredHBModel,
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
     config: FloquetConfig,
@@ -175,8 +176,7 @@ def compute_floquet_from_sampled_jacobians(
     stable = bool(spectral_radius <= 1.0 + float(config.stability_tolerance))
     _emit_progress(
         config,
-        "Floquet done, "
-        f"omega={samples.parameter:.10g}, rho={spectral_radius:.6e}, {_stability_label(stable)}",
+        f"Floquet done, omega={samples.parameter:.10g}, rho={spectral_radius:.6e}, {_stability_label(stable)}",
     )
     return FloquetResult(
         parameter=float(samples.parameter),
@@ -190,7 +190,7 @@ def compute_floquet_from_sampled_jacobians(
 
 
 def _prepare_solution_samples(
-    model: SecondOrderTimeModel,
+    model: _StructuredHBModel,
     coefficients: NDArray[np.float64],
     parameter: float,
     harmonics: Sequence[float],
@@ -229,13 +229,20 @@ def _prepare_solution_samples(
 
 
 def _sampled_jacobians_from_terms(
-    terms: Sequence[object],
+    terms: Sequence[NonlinearJacobianTerm],
     sample_count: int,
     n_dof: int,
 ) -> dict[JacobianVariable, tuple[sparse.csc_matrix, ...]]:
-    rows: dict[JacobianVariable, list[list[int]]] = {variable: [[] for _ in range(sample_count)] for variable in ("x", "dx", "ddx")}
-    cols: dict[JacobianVariable, list[list[int]]] = {variable: [[] for _ in range(sample_count)] for variable in ("x", "dx", "ddx")}
-    data: dict[JacobianVariable, list[list[float]]] = {variable: [[] for _ in range(sample_count)] for variable in ("x", "dx", "ddx")}
+    variables: tuple[JacobianVariable, ...] = ("x", "dx", "ddx")
+    rows: dict[JacobianVariable, list[list[int]]] = {
+        variable: [[] for _ in range(sample_count)] for variable in variables
+    }
+    cols: dict[JacobianVariable, list[list[int]]] = {
+        variable: [[] for _ in range(sample_count)] for variable in variables
+    }
+    data: dict[JacobianVariable, list[list[float]]] = {
+        variable: [[] for _ in range(sample_count)] for variable in variables
+    }
     for term in terms:
         variable = term.variable
         if variable not in rows:
@@ -261,7 +268,7 @@ def _sampled_jacobians_from_terms(
             ).tocsc()
             for index in range(sample_count)
         )
-        for variable in ("x", "dx", "ddx")
+        for variable in variables
     }
 
 
@@ -323,20 +330,12 @@ def _trapezoid_multipliers(
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
 ) -> NDArray[np.complex128]:
-    steps = _hsu_steps(samples, jacobians)
-    return _hsu_dense_multipliers(steps, samples.mass.shape[0])
-
-
-def _hsu_steps(
-    samples: _SolutionSamples,
-    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
-) -> tuple[_HsuStep, ...]:
     mass_base = samples.mass
     damping_base = samples.damping
     stiffness_base = samples.stiffness
     dt = float(samples.dt)
     identity = sparse.identity(samples.mass.shape[0], format="csc", dtype=np.float64)
-    steps = []
+    monodromy = np.eye(2 * samples.mass.shape[0], dtype=np.float64)
     for sample_index in range(samples.t.size):
         mass = mass_base + jacobians["ddx"][sample_index]
         damping = damping_base + jacobians["dx"][sample_index]
@@ -355,18 +354,7 @@ def _hsu_steps(
             ),
             format="csc",
         )
-        steps.append(_HsuStep(splu(left), right))
-    return tuple(steps)
-
-
-def _hsu_dense_multipliers(
-    steps: tuple[_HsuStep, ...],
-    n_dof: int,
-) -> NDArray[np.complex128]:
-    state_dim = 2 * n_dof
-    monodromy = np.eye(state_dim, dtype=np.float64)
-    for step in steps:
-        monodromy = step.left_lu.solve(step.right @ monodromy)
+        monodromy = splu(left).solve(right @ monodromy)
     return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
 
 
@@ -394,7 +382,7 @@ def _resolve_method(method: str) -> str:
 
 
 def _combine_sparse_time_operator_matrices(
-    terms: Sequence[object],
+    terms: Sequence[LinearOperatorTerm],
     parameter: float,
     n_dof: int,
 ) -> tuple[sparse.csc_matrix, sparse.csc_matrix, sparse.csc_matrix]:

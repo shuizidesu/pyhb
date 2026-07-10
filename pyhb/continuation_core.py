@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
 from scipy.sparse.linalg import splu
 
-from .harmonics import coefficient_matrix_from_fft, stack_fft_coefficients
-from .hb_operators import HBContext, harmonic_integral_matrices
-from .models import NonlinearJacobianTerm, SecondOrderTimeModel
+from .harmonics import coefficient_matrix_from_fft, generate_hb_items, stack_fft_coefficients
+from .hb_operators import FrequencyGrid, HBContext, harmonic_integral_matrices
+from .models import ForcingTerm, LinearOperatorTerm, NonlinearJacobianTerm
+
+
+class _StructuredHBModel(Protocol):
+    @property
+    def n_dof(self) -> int: ...
+
+    def linear_operator_terms(self) -> Sequence[LinearOperatorTerm]: ...
+
+    def forcing_terms(self, t: NDArray[np.float64]) -> Sequence[ForcingTerm]: ...
 
 
 @dataclass
 class _PreparedProblem:
-    model: SecondOrderTimeModel
+    model: _StructuredHBModel
     context: HBContext
     t: NDArray[np.float64]
     hb_item: NDArray[np.float64]
@@ -25,6 +35,68 @@ class _PreparedProblem:
     hb_item_ddt: NDArray[np.float64]
     operator_blocks: dict[float, sparse.csc_matrix]
     forcing_blocks: dict[float, NDArray[np.float64]]
+
+    def evaluate_powered(self, parameter: float, *, derivative: bool) -> "_PoweredEvaluation":
+        return _PoweredEvaluation(
+            operator=_combine_powered_sparse_blocks(self.operator_blocks, parameter),
+            forcing=_combine_powered_dense_blocks(self.forcing_blocks, parameter),
+            operator_derivative=(
+                _combine_powered_sparse_blocks(self.operator_blocks, parameter, derivative=True) if derivative else None
+            ),
+            forcing_derivative=(
+                _combine_powered_dense_blocks(self.forcing_blocks, parameter, derivative=True) if derivative else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class _PoweredEvaluation:
+    operator: sparse.csc_matrix
+    forcing: NDArray[np.float64]
+    operator_derivative: sparse.csc_matrix | None
+    forcing_derivative: NDArray[np.float64] | None
+
+
+@dataclass(frozen=True)
+class _ArcLengthMetric:
+    weights: NDArray[np.float64]
+
+    @classmethod
+    def build(
+        cls,
+        coefficient_count: int,
+        coefficient_scale: float,
+        scalar_scales: Sequence[float],
+    ) -> "_ArcLengthMetric":
+        weights = np.concatenate(
+            (
+                np.full(coefficient_count, 1.0 / float(coefficient_scale) ** 2, dtype=np.float64),
+                np.asarray([1.0 / float(scale) ** 2 for scale in scalar_scales], dtype=np.float64),
+            )
+        )
+        return cls(weights)
+
+    def constraint_row(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
+        vector = self._vector(tangent)
+        return self.weights * vector
+
+    def inner(self, left: NDArray[np.float64], right: NDArray[np.float64]) -> float:
+        left_vector = self._vector(left)
+        right_vector = self._vector(right)
+        return float(left_vector @ (self.weights * right_vector))
+
+    def normalize(self, vector: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = self._vector(vector)
+        norm = np.sqrt(self.inner(values, values))
+        if norm == 0.0:
+            raise np.linalg.LinAlgError("arc tangent has zero weighted norm")
+        return values / norm
+
+    def _vector(self, values: NDArray[np.float64]) -> NDArray[np.float64]:
+        vector = np.asarray(values, dtype=np.float64).reshape(-1)
+        if vector.size != self.weights.size:
+            raise ValueError(f"arc vector must have length {self.weights.size}, got {vector.size}")
+        return vector
 
 
 @dataclass(frozen=True)
@@ -52,10 +124,10 @@ def assemble_hb_jacobian_from_terms(
     if not terms:
         return sparse.csc_matrix((size, size), dtype=np.float64)
 
-    tensor_by_variable = {
-        "x": context.s3_tensor_x,
-        "dx": context.s3_tensor_dx,
-        "ddx": context.s3_tensor_ddx,
+    s3_by_variable = {
+        "x": context.s3,
+        "dx": context.s3_dx,
+        "ddx": context.s3_ddx,
     }
 
     force_dofs = np.empty(len(terms), dtype=np.int64)
@@ -64,7 +136,7 @@ def assemble_hb_jacobian_from_terms(
     values = np.empty((sample_count, len(terms)), dtype=np.float64)
 
     for index, term in enumerate(terms):
-        if term.variable not in tensor_by_variable:
+        if term.variable not in s3_by_variable:
             raise ValueError(f"unsupported nonlinear Jacobian variable {term.variable!r}")
         if not (0 <= term.force_dof < n_dof):
             raise ValueError(f"force_dof out of range: {term.force_dof}")
@@ -87,26 +159,25 @@ def assemble_hb_jacobian_from_terms(
         context.sample_count,
         context.nonlinear_harmonic_indices,
     )
-    row_offsets = np.arange(order, dtype=np.int64)
-    col_offsets = np.arange(order, dtype=np.int64)
+    local_rows = np.tile(np.arange(order, dtype=np.int64), order)
+    local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
     row_chunks: list[NDArray[np.int64]] = []
     col_chunks: list[NDArray[np.int64]] = []
     data_chunks: list[NDArray[np.float64]] = []
 
-    for variable, s_tensor in tensor_by_variable.items():
+    for variable, s3_matrix in s3_by_variable.items():
         term_indices = np.asarray(
             [index for index, term_variable in enumerate(variables) if term_variable == variable],
             dtype=np.int64,
         )
         if term_indices.size == 0:
             continue
-        blocks = np.einsum("abk,kt->abt", s_tensor, coeffs[:, term_indices])
-        term_blocks = np.moveaxis(blocks, 2, 0)
-        row_indices = force_dofs[term_indices, None, None] * order + row_offsets[None, :, None]
-        col_indices = coordinate_dofs[term_indices, None, None] * order + col_offsets[None, None, :]
-        row_chunks.append(np.broadcast_to(row_indices, term_blocks.shape).reshape(-1))
-        col_chunks.append(np.broadcast_to(col_indices, term_blocks.shape).reshape(-1))
-        data_chunks.append(term_blocks.reshape(-1))
+        term_blocks_flat = (s3_matrix @ coeffs[:, term_indices]).T
+        row_indices = force_dofs[term_indices, None] * order + local_rows[None, :]
+        col_indices = coordinate_dofs[term_indices, None] * order + local_cols[None, :]
+        row_chunks.append(row_indices.reshape(-1))
+        col_chunks.append(col_indices.reshape(-1))
+        data_chunks.append(term_blocks_flat.reshape(-1))
 
     rows = np.concatenate(row_chunks)
     cols = np.concatenate(col_chunks)
@@ -249,8 +320,70 @@ def _shrink_arc_length_for_parameter_step(
     return max(arc_length_step * scale, s_min)
 
 
+def _prepare_continuation_problem(
+    model: _StructuredHBModel,
+    *,
+    sample_fft: int,
+    harmonics: Sequence[float],
+    frequency_resolution: float,
+    frequency_tolerance: float,
+    s3_method: str,
+    s3_quadrature_samples: int | None,
+    progress_callback: Callable[[str], None] | None,
+) -> _PreparedProblem:
+    nonlinear_harmonics = _default_nonlinear_harmonics(
+        harmonics,
+        frequency_resolution,
+        frequency_tolerance,
+    )
+    context = HBContext.build(
+        harmonics,
+        nonlinear_harmonics,
+        sample_fft,
+        frequency_resolution,
+        frequency_tolerance,
+        s3_method,
+        s3_quadrature_samples,
+        progress_callback,
+    )
+    if progress_callback is not None:
+        progress_callback(f"Generating HB basis... period={context.period:.12g}, samples={sample_fft}")
+    t = np.arange(sample_fft, dtype=np.float64) * (context.period / sample_fft)
+    hb_item, hb_item_dt, hb_item_ddt = generate_hb_items(t, context.harmonics)
+    operator_blocks, forcing_blocks = _prepare_structured_parameter_blocks(
+        model,
+        context,
+        t,
+        sample_fft,
+    )
+    return _PreparedProblem(
+        model=model,
+        context=context,
+        t=t,
+        hb_item=hb_item,
+        hb_item_dt=hb_item_dt,
+        hb_item_ddt=hb_item_ddt,
+        operator_blocks=operator_blocks,
+        forcing_blocks=forcing_blocks,
+    )
+
+
+def _default_nonlinear_harmonics(
+    harmonics: Sequence[float],
+    frequency_resolution: float,
+    frequency_tolerance: float,
+) -> tuple[float, ...]:
+    grid = FrequencyGrid(frequency_resolution, frequency_tolerance)
+    hb = grid.values_for(harmonics)
+    harmonic_indices = grid.indices_for(hb)
+    if not harmonic_indices:
+        return tuple()
+    max_index = max(harmonic_indices)
+    return tuple(float(frequency_resolution) * index for index in range(1, 2 * max_index + 1))
+
+
 def _prepare_structured_parameter_blocks(
-    model: SecondOrderTimeModel,
+    model: _StructuredHBModel,
     context: HBContext,
     t: NDArray[np.float64],
     sample_fft: int,
@@ -266,30 +399,30 @@ def _prepare_structured_parameter_blocks(
     linear_terms = tuple(model.linear_operator_terms())
     if not linear_terms:
         raise ValueError("model.linear_operator_terms() must return at least one term")
-    for term in linear_terms:
-        if term.basis_type not in basis_by_type:
-            raise ValueError(f"unsupported linear operator basis_type: {term.basis_type!r}")
-        matrix = sparse.csc_matrix(term.matrix, dtype=np.float64)
+    for linear_term in linear_terms:
+        if linear_term.basis_type not in basis_by_type:
+            raise ValueError(f"unsupported linear operator basis_type: {linear_term.basis_type!r}")
+        matrix = sparse.csc_matrix(linear_term.matrix, dtype=np.float64)
         expected_matrix_shape = (model.n_dof, model.n_dof)
         if matrix.shape != expected_matrix_shape:
             raise ValueError(f"linear operator matrix must have shape {expected_matrix_shape}, got {matrix.shape}")
-        power = _validated_omega_power(term.omega_power)
+        power = _validated_omega_power(linear_term.omega_power)
         _add_powered_sparse_block(
             operator_blocks,
             power,
-            sparse.kron(matrix, basis_by_type[term.basis_type], format="csc"),
+            sparse.kron(matrix, basis_by_type[linear_term.basis_type], format="csc"),
         )
 
     forcing_blocks: dict[float, NDArray[np.float64]] = {}
     forcing_terms = tuple(model.forcing_terms(t))
     if not forcing_terms:
         raise ValueError("model.forcing_terms(t) must return at least one term")
-    for term in forcing_terms:
-        samples = np.asarray(term.samples, dtype=np.float64)
+    for forcing_term in forcing_terms:
+        samples = np.asarray(forcing_term.samples, dtype=np.float64)
         expected_samples_shape = (t.size, model.n_dof)
         if samples.shape != expected_samples_shape:
             raise ValueError(f"forcing term samples must have shape {expected_samples_shape}, got {samples.shape}")
-        power = _validated_omega_power(term.omega_power)
+        power = _validated_omega_power(forcing_term.omega_power)
         coefficients = stack_fft_coefficients(
             samples,
             context.harmonics,
@@ -382,6 +515,14 @@ def _solve_sparse(matrix: sparse.spmatrix, rhs: NDArray[np.float64]) -> NDArray[
     return splu(matrix.tocsc()).solve(np.asarray(rhs, dtype=np.float64))
 
 
+def _array_is_finite(values: NDArray[np.float64] | float) -> bool:
+    return bool(np.all(np.isfinite(np.asarray(values, dtype=np.float64))))
+
+
+def _sparse_is_finite(matrix: sparse.spmatrix) -> bool:
+    return bool(np.all(np.isfinite(matrix.data)))
+
+
 def _solve_one_parameter_bordered_arc(
     jacobian: sparse.spmatrix,
     parameter_column: NDArray[np.float64],
@@ -404,18 +545,31 @@ def _solve_one_parameter_bordered_arc(
     arc_q = arc_vector[:-1]
     arc_parameter = float(arc_vector[-1])
 
-    lu = splu(jacobian.tocsc())
-    residual_solve = lu.solve(-residual)
-    parameter_solve = lu.solve(parameter_column_vector)
-    denominator = float(arc_q @ parameter_solve + arc_parameter)
-    tolerance = 100.0 * np.finfo(np.float64).eps * max(
-        1.0,
-        float(np.linalg.norm(arc_q) * np.linalg.norm(parameter_solve) + abs(arc_parameter)),
-    )
-    if abs(denominator) <= tolerance:
-        raise np.linalg.LinAlgError(
-            "arc bordered solve is singular or ill-conditioned; "
-            f"denominator={denominator:.6e}, tolerance={tolerance:.6e}"
+    try:
+        lu = splu(jacobian.tocsc())
+        residual_solve = lu.solve(-residual)
+        parameter_solve = lu.solve(parameter_column_vector)
+        denominator = float(arc_q @ parameter_solve + arc_parameter)
+        tolerance = (
+            100.0
+            * np.finfo(np.float64).eps
+            * max(
+                1.0,
+                float(np.linalg.norm(arc_q) * np.linalg.norm(parameter_solve) + abs(arc_parameter)),
+            )
+        )
+        if abs(denominator) <= tolerance:
+            raise np.linalg.LinAlgError(
+                "arc bordered solve is singular or ill-conditioned; "
+                f"denominator={denominator:.6e}, tolerance={tolerance:.6e}"
+            )
+    except (RuntimeError, np.linalg.LinAlgError):
+        return _solve_augmented_one_parameter_bordered_arc(
+            jacobian,
+            parameter_column_vector,
+            arc_vector,
+            residual,
+            arc_residual,
         )
 
     parameter_delta = (float(arc_residual) - float(arc_q @ residual_solve)) / denominator
@@ -458,3 +612,21 @@ def _augmented_arc_matrix(
     arc_sparse = sparse.csr_matrix(np.asarray(arc_row, dtype=np.float64).reshape(1, size + 1))
     top = sparse.hstack((-jacobian, parameter_sparse), format="csc")
     return sparse.vstack((top, arc_sparse), format="csc")
+
+
+def _solve_augmented_one_parameter_bordered_arc(
+    jacobian: sparse.spmatrix,
+    parameter_column: NDArray[np.float64],
+    arc_row: NDArray[np.float64],
+    residual_vector: NDArray[np.float64],
+    arc_residual: float,
+) -> _BorderedArcSolve:
+    size = jacobian.shape[0]
+    augmented = _augmented_arc_matrix(jacobian, parameter_column, arc_row)
+    lu = splu(augmented)
+    delta_rhs = np.concatenate((np.asarray(residual_vector, dtype=np.float64).reshape(size), np.array([arc_residual])))
+    tangent_rhs = np.concatenate((np.zeros(size, dtype=np.float64), np.array([1.0])))
+    return _BorderedArcSolve(
+        delta=lu.solve(delta_rhs),
+        tangent_candidate=lu.solve(tangent_rhs),
+    )

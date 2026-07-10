@@ -11,13 +11,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
 from examples.machine_absorber.autodiff_model import MachineAbsorberAutodiffModel
-
+from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver, ContinuationResult
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc.npz"
 DEFAULT_MAX_STEPS = 420
-DEFAULT_SAMPLE_FFT = 2 ** 11
+DEFAULT_SAMPLE_FFT = 2**11
 FREQUENCY_RESOLUTION = 1.0
 INIT_OMEGA = 0.4
 MAX_EPOCH = 30

@@ -28,10 +28,7 @@ class FrequencyGrid:
         frequency_resolution = float(self.frequency_resolution)
         tolerance = float(self.tolerance)
         if not np.isfinite(frequency_resolution) or frequency_resolution <= 0.0:
-            raise ValueError(
-                "frequency_resolution must be a positive finite value, "
-                f"got {self.frequency_resolution!r}"
-            )
+            raise ValueError(f"frequency_resolution must be a positive finite value, got {self.frequency_resolution!r}")
         if not np.isfinite(tolerance) or tolerance < 0.0:
             raise ValueError(f"tolerance must be a non-negative finite value, got {self.tolerance!r}")
 
@@ -74,9 +71,8 @@ class HBContext:
     sample_count: int
     order: int
     s3: NDArray[np.float64]
-    s3_tensor_x: NDArray[np.float64]
-    s3_tensor_dx: NDArray[np.float64]
-    s3_tensor_ddx: NDArray[np.float64]
+    s3_dx: NDArray[np.float64]
+    s3_ddx: NDArray[np.float64]
 
     @classmethod
     def build(
@@ -114,10 +110,9 @@ class HBContext:
             quadrature_samples=s3_quadrature_samples,
         )
         order = 2 * len(hb) + 1
-        s3_tensor_x = s3_to_tensor(s3, order)
         coefficient_dt_map, coefficient_ddt_map = coefficient_derivative_maps(hb)
-        s3_tensor_dx = np.einsum("abk,bc->ack", s3_tensor_x, coefficient_dt_map)
-        s3_tensor_ddx = np.einsum("abk,bc->ack", s3_tensor_x, coefficient_ddt_map)
+        s3_dx = _differentiate_s3(s3, coefficient_dt_map, order)
+        s3_ddx = _differentiate_s3(s3, coefficient_ddt_map, order)
         _emit_progress(
             progress_callback,
             f"Precompute finished. order={order}, period={grid.period:.12g}, s3_shape={s3.shape}",
@@ -132,9 +127,8 @@ class HBContext:
             sample_count=int(sample_count),
             order=order,
             s3=s3,
-            s3_tensor_x=s3_tensor_x,
-            s3_tensor_dx=s3_tensor_dx,
-            s3_tensor_ddx=s3_tensor_ddx,
+            s3_dx=s3_dx,
+            s3_ddx=s3_ddx,
         )
 
 
@@ -156,17 +150,30 @@ def coefficient_derivative_maps(harmonics: ArrayLike) -> tuple[NDArray[np.float6
     return first, second
 
 
-def s3_to_tensor(s3: ArrayLike, order: int) -> NDArray[np.float64]:
-    s3_arr = np.asarray(s3, dtype=np.float64)
-    if s3_arr.ndim != 2 or s3_arr.shape[0] != order * order:
-        raise ValueError("s3 must be shaped (order * order, nonlinear_order)")
-    return np.stack(
-        [s3_arr[:, index].reshape((order, order), order="F") for index in range(s3_arr.shape[1])],
-        axis=2,
+def _differentiate_s3(
+    s3: ArrayLike,
+    derivative_map: ArrayLike,
+    order: int,
+) -> NDArray[np.float64]:
+    s3_matrix = np.asarray(s3, dtype=np.float64)
+    derivative = np.asarray(derivative_map, dtype=np.float64)
+    if s3_matrix.ndim != 2 or s3_matrix.shape[0] != order * order:
+        raise ValueError("s3 must have shape (order * order, nonlinear_order)")
+    if derivative.shape != (order, order):
+        raise ValueError(f"derivative_map must have shape {(order, order)}, got {derivative.shape}")
+
+    nonlinear_order = s3_matrix.shape[1]
+    tensor = s3_matrix.reshape((order, order, nonlinear_order), order="F")
+    differentiated = np.einsum("abk,bc->ack", tensor, derivative, optimize=True)
+    return np.asarray(differentiated, dtype=np.float64).reshape(
+        (order * order, nonlinear_order),
+        order="F",
     )
 
 
-def harmonic_integral_matrices(harmonics: ArrayLike) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+def harmonic_integral_matrices(
+    harmonics: ArrayLike,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Analytic equivalents of the MATLAB ``integral(...)/pi`` matrices."""
 
     hb = np.asarray(harmonics, dtype=np.float64).reshape(-1)
@@ -198,7 +205,7 @@ def integrate_s3(
     epsabs: float = 1e-10,
     epsrel: float = 1e-10,
 ) -> NDArray[np.float64]:
-    """Compute the nonlinear Jacobian common tensor ``S3``."""
+    """Compute the flattened nonlinear Jacobian projection matrix ``S3``."""
 
     hb = np.asarray(harmonics, dtype=np.float64).reshape(-1)
     nlhb = np.asarray(nonlinear_harmonics, dtype=np.float64).reshape(-1)
@@ -241,15 +248,20 @@ def integrate_s3_fast(
     harmonic_indices: ArrayLike,
     nonlinear_harmonic_indices: ArrayLike,
 ) -> NDArray[np.float64]:
-    """Compute S3 by exact periodic-grid projection for aligned harmonics."""
+    """Compute flattened S3 by exact periodic-grid projection for aligned harmonics."""
 
     n_samples = choose_s3_sample_count(sample_count, harmonic_indices, nonlinear_harmonic_indices)
     tau = np.arange(n_samples, dtype=np.float64) * (period / n_samples)
     hb_item, _, _ = generate_hb_items(tau, harmonics)
     order = hb_item.shape[1]
     products = (hb_item[:, :, None] * hb_item[:, None, :]).reshape(n_samples, order * order, order="F")
-    product_fft = np.fft.fft(products, axis=0) * (2.0 / n_samples)
+    product_fft = np.fft.rfft(products, axis=0) * (2.0 / n_samples)
     nonlinear_indices = np.asarray(nonlinear_harmonic_indices, dtype=np.int64).reshape(-1)
+    if np.any(nonlinear_indices < 0) or np.any(nonlinear_indices >= product_fft.shape[0]):
+        raise ValueError(
+            "nonlinear harmonic FFT indices exceed the fast S3 projection grid; "
+            f"maximum supported index is {product_fft.shape[0] - 1}"
+        )
     return np.asarray(
         np.hstack(
             (
@@ -287,11 +299,3 @@ def compute_s3(
     if method == "quad":
         return integrate_s3(harmonics, nonlinear_harmonics, period=period)
     raise ValueError(f"unsupported s3_method {method!r}; expected 'fast' or 'quad'")
-
-
-def build_full_fft_nonlinear_harmonics(sample_count: int, frequency_resolution: float) -> tuple[float, ...]:
-    """Return all positive FFT-bin harmonic values through Nyquist."""
-
-    if sample_count < 2:
-        raise ValueError("sample_count must be at least 2")
-    return tuple(float(frequency_resolution) * index for index in range(1, int(sample_count) // 2 + 1))

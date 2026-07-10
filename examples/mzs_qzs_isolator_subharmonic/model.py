@@ -97,11 +97,7 @@ class MzsQzsModel(SecondOrderTimeModel):
         middle = mu5_sq + x**2
         lower = (mu3 - x) ** 2 + mu2_sq
 
-        damping = (
-            8.0 * zeta1 * mu2_sq / upper**2
-            + 8.0 * zeta2 * mu5_sq / middle**2
-            + 8.0 * zeta3 * mu2_sq / lower**2
-        )
+        damping = 8.0 * zeta1 * mu2_sq / upper**2 + 8.0 * zeta2 * mu5_sq / middle**2 + 8.0 * zeta3 * mu2_sq / lower**2
         damping_derivative = (
             -32.0 * zeta1 * mu2_sq * (mu3 + x) / upper**3
             - 32.0 * zeta2 * mu5_sq * x / middle**3
@@ -113,9 +109,9 @@ class MzsQzsModel(SecondOrderTimeModel):
             - lambda1 * mu4 * x / np.sqrt(middle)
         )
         restoring_derivative = (
-            -(1.0 + mu1) * mu2_sq / upper ** 1.5
-            - (1.0 + mu1) * mu2_sq / lower ** 1.5
-            - lambda1 * mu4 * mu5_sq / middle ** 1.5
+            -(1.0 + mu1) * mu2_sq / upper**1.5
+            - (1.0 + mu1) * mu2_sq / lower**1.5
+            - lambda1 * mu4 * mu5_sq / middle**1.5
         )
         return damping, damping_derivative, restoring, restoring_derivative
 

@@ -63,4 +63,3 @@ class VanderpolAutodiffModel(AutodiffFreeFrequencySecondOrderTimeModel):
         lambda_value = float(self.parameters.lambda_value)
         generalized = -parameter * omega * (lambda_value - displacement.pow(2)) * velocity
         return generalized.reshape(-1, 1)
-

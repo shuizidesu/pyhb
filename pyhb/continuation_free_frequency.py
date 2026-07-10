@@ -10,23 +10,29 @@ from numpy.typing import NDArray
 from scipy import sparse
 from scipy.sparse.linalg import splu
 
-from .continuation import ContinuationConfig, ContinuationSolver
+from .continuation import ContinuationConfig, _validate_continuation_config
 from .continuation_core import (
+    _ArcLengthMetric,
+    _array_is_finite,
     _coefficient_matrix,
     _evaluate_local_state,
     _local_jacobian_terms_to_global,
     _local_samples_to_global_coefficients,
     _parameter_step_too_large,
+    _PoweredEvaluation,
+    _prepare_continuation_problem,
     _residual_stats,
+    _ResidualStats,
     _shrink_arc_length_for_parameter_step,
     _solve_sparse,
-    _validated_dofs,
+    _sparse_is_finite,
     _validate_optional_positive_scale,
     _validate_positive_scale,
+    _validated_dofs,
     assemble_hb_jacobian_from_terms,
 )
-from .hb_operators import coefficient_derivative_maps
 from .harmonics import flatten_coefficients
+from .hb_operators import coefficient_derivative_maps
 from .models import FreeFrequencySecondOrderTimeModel, HarmonicCoefficientConstraint, ReferencePhaseCondition
 
 
@@ -91,7 +97,16 @@ class _GeneralizedEvaluation:
     parameter_coefficients: NDArray[np.float64] | None = None
 
 
-class ContinuationFreeFrequencySolver(ContinuationSolver):
+def _generalized_evaluation_is_finite(generalized: _GeneralizedEvaluation) -> bool:
+    return (
+        _array_is_finite(generalized.coefficients)
+        and _sparse_is_finite(generalized.jacobian)
+        and _array_is_finite(generalized.omega_coefficients)
+        and (generalized.parameter_coefficients is None or _array_is_finite(generalized.parameter_coefficients))
+    )
+
+
+class ContinuationFreeFrequencySolver:
     """Arc-length continuation with unknown response frequency and one true parameter."""
 
     def __init__(
@@ -101,19 +116,34 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
     ) -> None:
         if not isinstance(model, FreeFrequencySecondOrderTimeModel):
             raise TypeError("ContinuationFreeFrequencySolver requires a FreeFrequencySecondOrderTimeModel")
-        super().__init__(model, config or ContinuationFreeFrequencyConfig())
-        self.model: FreeFrequencySecondOrderTimeModel
-        self.config: ContinuationFreeFrequencyConfig
+        self.model = model
+        self.config = config or ContinuationFreeFrequencyConfig()
+        _validate_continuation_config(self.config)
         _validate_positive_scale("parameter_scale", self.config.parameter_scale)
         _validate_positive_scale("constraint_tolerance", self.config.constraint_tolerance)
         _validate_optional_positive_scale("max_parameter_step", self.config.max_parameter_step)
+        self.prepared = _prepare_continuation_problem(
+            self.model,
+            sample_fft=self.config.sample_fft,
+            harmonics=self.config.harmonics,
+            frequency_resolution=self.config.frequency_resolution,
+            frequency_tolerance=self.config.frequency_tolerance,
+            s3_method=self.config.s3_method,
+            s3_quadrature_samples=self.config.s3_quadrature_samples,
+            progress_callback=self.config.progress_callback,
+        )
+        self._arc_metric = _ArcLengthMetric.build(
+            self.model.n_dof * self.prepared.context.order,
+            self.config.q_scale,
+            (self.config.omega_scale, self.config.parameter_scale),
+        )
         self._initial_constraint_index = _constraint_flat_index(
             self.config.initial_constraint,
             self.prepared.context.order,
             self.model.n_dof,
         )
         if isinstance(self.config.phase_condition, HarmonicCoefficientConstraint):
-            self._phase_constraint_index = _constraint_flat_index(
+            self._phase_constraint_index: int | None = _constraint_flat_index(
                 self.config.phase_condition,
                 self.prepared.context.order,
                 self.model.n_dof,
@@ -124,15 +154,34 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             raise TypeError("phase_condition must be HarmonicCoefficientConstraint or ReferencePhaseCondition")
         self._coefficient_dt_map = coefficient_derivative_maps(self.prepared.context.harmonics)[0]
 
+    def _emit_progress(self, message: str) -> None:
+        if self.config.progress_callback is not None:
+            self.config.progress_callback(message)
+
+    def _evaluate_local_state(
+        self,
+        coefficients: NDArray[np.float64],
+        coordinate_dofs: tuple[int, ...],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        return _evaluate_local_state(
+            coefficients,
+            coordinate_dofs,
+            self.prepared.hb_item,
+            self.prepared.hb_item_dt,
+            self.prepared.hb_item_ddt,
+        )
+
     def _residual_terms(
         self,
         coeff_line: NDArray[np.float64],
         generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
+        powered: _PoweredEvaluation | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        forcing_coefficients = self._forcing_coefficients(omega)
-        linear_coefficients = self._linear_jacobian(omega) @ coeff_line
+        active_powered = powered or self.prepared.evaluate_powered(omega, derivative=False)
+        forcing_coefficients = active_powered.forcing
+        linear_coefficients = active_powered.operator @ coeff_line
         residual = forcing_coefficients - generalized.coefficients - linear_coefficients
         return residual, forcing_coefficients, generalized.coefficients, linear_coefficients
 
@@ -141,8 +190,10 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
+        powered: _PoweredEvaluation | None = None,
     ) -> sparse.csc_matrix:
-        return self._linear_jacobian(omega) + generalized.jacobian
+        active_powered = powered or self.prepared.evaluate_powered(omega, derivative=False)
+        return active_powered.operator + generalized.jacobian
 
     def _evaluate_generalized(
         self,
@@ -252,11 +303,15 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
+        powered: _PoweredEvaluation | None = None,
     ) -> NDArray[np.float64]:
+        active_powered = powered or self.prepared.evaluate_powered(omega, derivative=True)
+        if active_powered.forcing_derivative is None or active_powered.operator_derivative is None:
+            raise ValueError("powered evaluation does not include omega derivatives")
         return (
-            self._forcing_derivative_coefficients(omega)
+            active_powered.forcing_derivative
             - generalized.omega_coefficients
-            - self._linear_jacobian_derivative(omega) @ coeff_line
+            - active_powered.operator_derivative @ coeff_line
         )
 
     def _parameter_column(
@@ -371,6 +426,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         NDArray[np.float64],
         _GeneralizedEvaluation,
         sparse.csc_matrix,
+        _PoweredEvaluation,
         ContinuationFreeFrequencyStepLog,
     ]:
         config = self.config
@@ -383,24 +439,22 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         generalized = None
         jacobian = None
 
-        while (
-            epoch < config.max_epoch
-            and not _free_converged(
-                residual_stats.relative_residual,
-                constraint_residual,
-                float(np.max(np.abs(delta))),
-                config.res_tolerance,
-                config.constraint_tolerance,
-                config.delta_tolerance,
-            )
+        while epoch < config.max_epoch and not _free_converged(
+            residual_stats.relative_residual,
+            constraint_residual,
+            float(np.max(np.abs(delta))),
+            config.res_tolerance,
+            config.constraint_tolerance,
+            config.delta_tolerance,
         ):
             coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
             generalized = self._evaluate_generalized(coeff, omega, parameter, include_parameter=False)
-            jacobian = self._jacobian(generalized, omega, parameter)
-            residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
+            powered = self.prepared.evaluate_powered(omega, derivative=True)
+            jacobian = self._jacobian(generalized, omega, parameter, powered)
+            residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter, powered)
             residual_vector = residual_terms[0]
             residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-            omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
+            omega_column = self._omega_column(coeff_line, generalized, omega, parameter, powered)
             constraint_residual = self._fixed_constraint_residual(
                 coeff_line,
                 config.initial_constraint,
@@ -416,8 +470,9 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
 
         coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
         generalized = self._evaluate_generalized(coeff, omega, parameter, include_parameter=True)
-        jacobian = self._jacobian(generalized, omega, parameter)
-        residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
+        powered = self.prepared.evaluate_powered(omega, derivative=True)
+        jacobian = self._jacobian(generalized, omega, parameter, powered)
+        residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter, powered)
         residual_vector = residual_terms[0]
         residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
         constraint_residual = self._fixed_constraint_residual(
@@ -445,27 +500,14 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                 config.delta_tolerance,
             ),
         )
-        return coeff_line, float(omega), coeff, generalized, jacobian, log
-
-    def _arc_weights(self, size: int) -> NDArray[np.float64]:
-        return np.concatenate(
-            (
-                np.full(size - 2, 1.0 / float(self.config.q_scale) ** 2, dtype=np.float64),
-                np.array(
-                    [
-                        1.0 / float(self.config.omega_scale) ** 2,
-                        1.0 / float(self.config.parameter_scale) ** 2,
-                    ],
-                    dtype=np.float64,
-                ),
-            )
-        )
+        return coeff_line, float(omega), coeff, generalized, jacobian, powered, log
 
     def _orient_initial_tangent(self, tangent: NDArray[np.float64]) -> NDArray[np.float64]:
         oriented = np.asarray(tangent, dtype=np.float64)
-        if oriented[-1] < 0.0:
+        direction = 1.0 if self.config.initial_direction == "up" else -1.0
+        if oriented[-1] * direction < 0.0:
             oriented = -oriented
-        return self._weighted_normalize(oriented)
+        return self._arc_metric.normalize(oriented)
 
     def _initial_tangent_free(
         self,
@@ -474,16 +516,15 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         omega: float,
         parameter: float,
         jacobian: sparse.csc_matrix,
+        powered: _PoweredEvaluation,
     ) -> NDArray[np.float64]:
-        omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
+        omega_column = self._omega_column(coeff_line, generalized, omega, parameter, powered)
         parameter_column = self._parameter_column(generalized)
         phase_row = self._phase_constraint_row(jacobian.shape[0], coeff_line)
         tangent_matrix = self._initial_matrix(jacobian, omega_column, phase_row)
         rhs = np.concatenate((parameter_column, np.array([0.0], dtype=np.float64)))
         tangent_q_omega = _solve_sparse(tangent_matrix, rhs)
-        return self._orient_initial_tangent(
-            np.concatenate((tangent_q_omega, np.array([1.0], dtype=np.float64)))
-        )
+        return self._orient_initial_tangent(np.concatenate((tangent_q_omega, np.array([1.0], dtype=np.float64))))
 
     def run(
         self,
@@ -499,7 +540,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
         omega = float(config.init_omega if initial_omega is None else initial_omega)
         parameter = float(config.init_parameter if initial_parameter is None else initial_parameter)
 
-        coeff_line, omega, coeff, generalized, jacobian, initial_log = self._solve_initial_free(
+        coeff_line, omega, coeff, generalized, jacobian, powered, initial_log = self._solve_initial_free(
             coeff_line,
             omega,
             parameter,
@@ -512,13 +553,23 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             f"Parameter = {initial_log.parameter:.10g}"
         )
 
-        tangent = self._initial_tangent_free(coeff_line, generalized, omega, parameter, jacobian)
         y0 = np.concatenate((coeff_line, np.array([omega, parameter], dtype=np.float64)))
 
         omega_history: list[float] = [float(omega)] if initial_log.converged else []
         parameter_history: list[float] = [float(parameter)] if initial_log.converged else []
         coefficient_history: list[NDArray[np.float64]] = [coeff.copy()] if initial_log.converged else []
         logs: list[ContinuationFreeFrequencyStepLog] = []
+        if not initial_log.converged or config.max_steps == 0:
+            return self._build_result(
+                y0,
+                coefficient_history,
+                omega_history,
+                parameter_history,
+                logs,
+                initial_log,
+            )
+
+        tangent = self._initial_tangent_free(coeff_line, generalized, omega, parameter, jacobian, powered)
         arc_length_step = float(config.s_initial)
         shrink_count = 0
 
@@ -536,9 +587,11 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                 constraint_residual = np.inf
                 delta = np.full(self.model.n_dof * order + 2, np.inf, dtype=np.float64)
                 j_arc_lu = None
+                nonfinite_trial = not _array_is_finite(y)
 
                 while (
-                    epoch < config.max_epoch
+                    not nonfinite_trial
+                    and epoch < config.max_epoch
                     and not _free_converged(
                         residual_stats.relative_residual,
                         constraint_residual,
@@ -548,52 +601,85 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                         config.delta_tolerance,
                     )
                 ):
+                    if not _array_is_finite(coeff_line) or not np.isfinite(omega) or not np.isfinite(parameter):
+                        nonfinite_trial = True
+                        break
                     coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
                     generalized = self._evaluate_generalized(coeff, omega, parameter, include_parameter=True)
-                    jacobian = self._jacobian(generalized, omega, parameter)
-                    residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter)
+                    if not _generalized_evaluation_is_finite(generalized):
+                        nonfinite_trial = True
+                        break
+                    powered = self.prepared.evaluate_powered(omega, derivative=True)
+                    jacobian = self._jacobian(generalized, omega, parameter, powered)
+                    if not _sparse_is_finite(jacobian):
+                        nonfinite_trial = True
+                        break
+                    residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter, powered)
                     residual_vector = residual_terms[0]
+                    if not all(_array_is_finite(term) for term in residual_terms):
+                        residual_stats = _ResidualStats(np.inf, np.inf)
+                        nonfinite_trial = True
+                        break
                     residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-                    omega_column = self._omega_column(coeff_line, generalized, omega, parameter)
+                    omega_column = self._omega_column(coeff_line, generalized, omega, parameter, powered)
                     parameter_column = self._parameter_column(generalized)
                     constraint_residual = self._phase_constraint_residual(coeff_line, phase_reference)
+                    if (
+                        not _array_is_finite(omega_column)
+                        or not _array_is_finite(parameter_column)
+                        or not np.isfinite(constraint_residual)
+                    ):
+                        nonfinite_trial = True
+                        break
                     r_arc = np.concatenate(
                         (
                             residual_vector,
                             np.array(
                                 [
                                     constraint_residual,
-                                    self._weighted_inner(y - y0, tangent) - arc_length_step,
+                                    self._arc_metric.inner(y - y0, tangent) - arc_length_step,
                                 ],
                                 dtype=np.float64,
                             ),
                         )
                     )
+                    if not _array_is_finite(r_arc):
+                        nonfinite_trial = True
+                        break
                     j_arc_v = self._arc_matrix(
                         jacobian,
                         omega_column,
                         parameter_column,
                         phase_row,
-                        self._weighted_constraint_row(tangent),
+                        self._arc_metric.constraint_row(tangent),
                     )
+                    if not _sparse_is_finite(j_arc_v):
+                        nonfinite_trial = True
+                        break
                     j_arc_lu = splu(j_arc_v)
                     delta = j_arc_lu.solve(r_arc)
+                    if not _array_is_finite(delta):
+                        nonfinite_trial = True
+                        break
                     y = y - delta
                     coeff_line = y[:-2].copy()
                     omega = float(y[-2])
                     parameter = float(y[-1])
                     epoch += 1
 
-                max_delta = float(np.max(np.abs(delta)))
-                converged = _free_converged(
-                    residual_stats.relative_residual,
-                    constraint_residual,
-                    max_delta,
-                    config.res_tolerance,
-                    config.constraint_tolerance,
-                    config.delta_tolerance,
+                max_delta = float(np.max(np.abs(delta))) if _array_is_finite(delta) else np.inf
+                converged = bool(
+                    not nonfinite_trial
+                    and _free_converged(
+                        residual_stats.relative_residual,
+                        constraint_residual,
+                        max_delta,
+                        config.res_tolerance,
+                        config.constraint_tolerance,
+                        config.delta_tolerance,
+                    )
                 )
-                parameter_step = abs(float(parameter) - float(y0[-1]))
+                parameter_step = abs(float(parameter) - float(y0[-1])) if np.isfinite(parameter) else np.inf
                 raw_parameter_step_too_large = _parameter_step_too_large(config.max_parameter_step, parameter_step)
                 parameter_step_too_large = bool(converged and raw_parameter_step_too_large)
                 accepted = bool(converged and not parameter_step_too_large)
@@ -634,13 +720,13 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                         omega_column,
                         parameter_column,
                         next_phase_row,
-                        self._weighted_constraint_row(tangent),
+                        self._arc_metric.constraint_row(tangent),
                     )
                     tangent_candidate = _solve_sparse(
                         tangent_matrix,
-                        np.concatenate((np.zeros(jacobian.shape[0] + 1), np.array([1.0], dtype=np.float64)))
+                        np.concatenate((np.zeros(jacobian.shape[0] + 1), np.array([1.0], dtype=np.float64))),
                     )
-                    tangent = self._weighted_normalize(tangent_candidate)
+                    tangent = self._arc_metric.normalize(tangent_candidate)
                     coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)
                     omega_history.append(float(omega))
                     parameter_history.append(float(parameter))
@@ -651,10 +737,12 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
 
                 shrink_count += 1
                 if parameter_step_too_large:
+                    if config.max_parameter_step is None:
+                        raise RuntimeError("max_parameter_step is required for parameter-step shrinking")
                     arc_length_step = _shrink_arc_length_for_parameter_step(
                         arc_length_step,
                         parameter_step,
-                        float(config.max_parameter_step),
+                        config.max_parameter_step,
                         config.parameter_step_safety,
                         config.s_min,
                     )
@@ -662,7 +750,7 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
                         break
                     continue
 
-                if epoch >= config.max_epoch:
+                if nonfinite_trial or epoch >= config.max_epoch:
                     arc_length_step = max(0.5 * arc_length_step, config.s_min)
                 else:
                     arc_length_step = min(2.0 * arc_length_step, config.s_max)
@@ -671,6 +759,24 @@ class ContinuationFreeFrequencySolver(ContinuationSolver):
             if shrink_count >= config.shrink_limit:
                 break
 
+        return self._build_result(
+            y0,
+            coefficient_history,
+            omega_history,
+            parameter_history,
+            logs,
+            initial_log,
+        )
+
+    def _build_result(
+        self,
+        y0: NDArray[np.float64],
+        coefficient_history: list[NDArray[np.float64]],
+        omega_history: list[float],
+        parameter_history: list[float],
+        logs: list[ContinuationFreeFrequencyStepLog],
+        initial_log: ContinuationFreeFrequencyStepLog,
+    ) -> ContinuationFreeFrequencyResult:
         final_coeff = _coefficient_matrix(y0[:-2], self.prepared.context.order, self.model.n_dof)
         coefficient_history_array = (
             np.asarray(coefficient_history, dtype=np.float64)

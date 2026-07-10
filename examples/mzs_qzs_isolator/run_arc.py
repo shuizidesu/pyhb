@@ -11,14 +11,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from pyhb import ContinuationConfig, ContinuationResult, ContinuationSolver
 from examples.mzs_qzs_isolator.model import MzsQzsModel
-
+from pyhb import ContinuationConfig, ContinuationResult, ContinuationSolver
 
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "results" / "arc.npz"
 DEFAULT_INITIAL_CONDITION = Path(__file__).resolve().parent / "data" / "initial_condition_1period.npz"
 DEFAULT_MAX_STEPS = 420
-DEFAULT_SAMPLE_FFT = 2 ** 11
+DEFAULT_SAMPLE_FFT = 2**11
 FREQUENCY_RESOLUTION = 1.0
 INIT_OMEGA = 0.01
 MAX_EPOCH = 30
