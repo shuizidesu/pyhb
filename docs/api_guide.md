@@ -39,8 +39,9 @@ Most users start from objects exported by `pyhb.__init__`:
 
 Lower-level modules provide the assembly building blocks used by the solvers:
 
-- `pyhb.models` defines structured linear terms, forcing terms, local nonlinear
-  Jacobian terms, DOF validation, and local-to-global nonlinear scattering.
+- `pyhb.models` defines structured linear and forcing terms,
+  `LocalJacobianMatrices`, DOF validation, and local-to-global nonlinear
+  scattering.
 - `pyhb.harmonics` defines the HB basis order and FFT projection helpers.
 - `pyhb.hb_operators` builds reusable HB metadata: frequency grids, derivative
   maps, linear projection matrices, and the flattened S3 operators used for nonlinear
