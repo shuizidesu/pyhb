@@ -19,11 +19,19 @@ from .autodiff_utils import (
 from .floquet import (
     FloquetConfig,
     FloquetResult,
-    compute_floquet_from_sampled_jacobians,
+    _resolve_method,
+    compute_floquet_from_dense_jacobians,
+    compute_floquet_from_sparse_jacobians,
+    dense_jacobians_from_local_matrices,
     prepare_solution_samples,
-    sampled_jacobians_from_local_arrays,
+    sampled_jacobians_from_local_matrices,
 )
-from .models import AutodiffFreeFrequencySecondOrderTimeModel, AutodiffSecondOrderTimeModel, JacobianVariable
+from .models import (
+    AutodiffFreeFrequencySecondOrderTimeModel,
+    AutodiffSecondOrderTimeModel,
+    JacobianVariable,
+    LocalJacobianMatrices,
+)
 
 
 def compute_floquet_autodiff(
@@ -38,6 +46,7 @@ def compute_floquet_autodiff(
     """Compute Floquet multipliers using Torch autodiff nonlinear Jacobians."""
 
     active_config = config or FloquetConfig()
+    method = _resolve_method(active_config.method)
     device = _resolve_torch_device(torch_device)
     variables = _validate_autodiff_variables(model.autodiff_variables)
     samples = prepare_solution_samples(
@@ -48,7 +57,7 @@ def compute_floquet_autodiff(
         frequency_resolution,
         active_config,
     )
-    jacobian_by_variable = _autodiff_jacobians(
+    local_jacobian = _autodiff_jacobians(
         model,
         samples.t,
         samples.x[:, list(model.nonlinear_coordinate_dofs)],
@@ -58,19 +67,23 @@ def compute_floquet_autodiff(
         variables,
         device,
     )
-    sampled_jacobians = sampled_jacobians_from_local_arrays(
+    if method == "exponential":
+        jacobians = dense_jacobians_from_local_matrices(
+            model.nonlinear_force_dofs,
+            model.nonlinear_coordinate_dofs,
+            local_jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        return compute_floquet_from_dense_jacobians(model, samples, jacobians, active_config)
+    jacobians = sampled_jacobians_from_local_matrices(
         model.nonlinear_force_dofs,
         model.nonlinear_coordinate_dofs,
-        jacobian_by_variable,
+        local_jacobian,
         samples.t.size,
         model.n_dof,
     )
-    return compute_floquet_from_sampled_jacobians(
-        model,
-        samples,
-        sampled_jacobians,
-        active_config,
-    )
+    return compute_floquet_from_sparse_jacobians(model, samples, jacobians, active_config)
 
 
 def compute_free_frequency_floquet_autodiff(
@@ -86,6 +99,7 @@ def compute_free_frequency_floquet_autodiff(
     """Compute free-frequency Floquet multipliers using Torch autodiff Jacobians."""
 
     active_config = config or FloquetConfig()
+    method = _resolve_method(active_config.method)
     device = _resolve_torch_device(torch_device)
     variables = _validate_autodiff_variables(model.autodiff_variables)
     samples = prepare_solution_samples(
@@ -96,7 +110,7 @@ def compute_free_frequency_floquet_autodiff(
         frequency_resolution,
         active_config,
     )
-    jacobian_by_variable = _free_frequency_autodiff_jacobians(
+    local_jacobian = _free_frequency_autodiff_jacobians(
         model,
         samples.t,
         samples.x[:, list(model.residual_coordinate_dofs)],
@@ -107,19 +121,23 @@ def compute_free_frequency_floquet_autodiff(
         variables,
         device,
     )
-    sampled_jacobians = sampled_jacobians_from_local_arrays(
+    if method == "exponential":
+        jacobians = dense_jacobians_from_local_matrices(
+            model.residual_force_dofs,
+            model.residual_coordinate_dofs,
+            local_jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        return compute_floquet_from_dense_jacobians(model, samples, jacobians, active_config)
+    jacobians = sampled_jacobians_from_local_matrices(
         model.residual_force_dofs,
         model.residual_coordinate_dofs,
-        jacobian_by_variable,
+        local_jacobian,
         samples.t.size,
         model.n_dof,
     )
-    return compute_floquet_from_sampled_jacobians(
-        model,
-        samples,
-        sampled_jacobians,
-        active_config,
-    )
+    return compute_floquet_from_sparse_jacobians(model, samples, jacobians, active_config)
 
 
 def _autodiff_jacobians(
@@ -131,7 +149,7 @@ def _autodiff_jacobians(
     parameter: float,
     variables: tuple[JacobianVariable, ...],
     device: torch.device,
-) -> dict[JacobianVariable, NDArray[np.float64]]:
+) -> LocalJacobianMatrices:
     t_tensor = _as_torch(t, device)
     x_tensor = _as_torch(local_x, device)
     dx_tensor = _as_torch(local_dx, device)
@@ -154,7 +172,11 @@ def _autodiff_jacobians(
             )
         )(_select_variable(variable, x_tensor, dx_tensor, ddx_tensor))
         jacobian_by_variable[variable] = _to_numpy(jacobian.permute(1, 0, 2).contiguous())
-    return jacobian_by_variable
+    return LocalJacobianMatrices(
+        x=jacobian_by_variable.get("x"),
+        dx=jacobian_by_variable.get("dx"),
+        ddx=jacobian_by_variable.get("ddx"),
+    )
 
 
 def _free_frequency_autodiff_jacobians(
@@ -167,7 +189,7 @@ def _free_frequency_autodiff_jacobians(
     parameter: float,
     variables: tuple[JacobianVariable, ...],
     device: torch.device,
-) -> dict[JacobianVariable, NDArray[np.float64]]:
+) -> LocalJacobianMatrices:
     t_tensor = _as_torch(t, device)
     x_tensor = _as_torch(local_x, device)
     dx_tensor = _as_torch(local_dx, device)
@@ -192,7 +214,11 @@ def _free_frequency_autodiff_jacobians(
             )
         )(_select_variable(variable, x_tensor, dx_tensor, ddx_tensor))
         jacobian_by_variable[variable] = _to_numpy(jacobian.permute(1, 0, 2).contiguous())
-    return jacobian_by_variable
+    return LocalJacobianMatrices(
+        x=jacobian_by_variable.get("x"),
+        dx=jacobian_by_variable.get("dx"),
+        ddx=jacobian_by_variable.get("ddx"),
+    )
 
 
 def _force_sum(

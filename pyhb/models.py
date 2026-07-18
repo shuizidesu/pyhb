@@ -37,46 +37,18 @@ class ForcingTerm:
 
 
 @dataclass(frozen=True)
-class NonlinearJacobianTerm:
-    """One nonzero time-domain nonlinear Jacobian entry.
+class LocalJacobianMatrices:
+    """Batched local Jacobian matrices for displacement and its derivatives.
 
-    ``values`` contains samples of
-    ``d nonlinear_force[force_dof] / d variable[coordinate_dof]``.
-    The solver projects these samples into HB space.
+    Each non-``None`` array is shaped
+    ``(sample_count, local_force_count, local_coordinate_count)``. ``dx`` and
+    ``ddx`` denote derivatives with respect to the first and second
+    derivatives on the dimensionless phase-time grid used by HB.
     """
 
-    force_dof: int
-    variable: JacobianVariable
-    coordinate_dof: int
-    values: NDArray[np.float64]
-
-
-@dataclass(frozen=True)
-class LocalNonlinearJacobianTerm:
-    """One nonzero local nonlinear Jacobian entry.
-
-    ``force_index`` indexes ``nonlinear_force_dofs`` and
-    ``coordinate_index`` indexes ``nonlinear_coordinate_dofs``.
-    """
-
-    force_index: int
-    variable: JacobianVariable
-    coordinate_index: int
-    values: NDArray[np.float64]
-
-
-@dataclass(frozen=True)
-class LocalResidualJacobianTerm:
-    """One nonzero local generalized residual Jacobian entry.
-
-    ``force_index`` indexes ``residual_force_dofs`` and ``coordinate_index``
-    indexes ``residual_coordinate_dofs``.
-    """
-
-    force_index: int
-    variable: JacobianVariable
-    coordinate_index: int
-    values: NDArray[np.float64]
+    x: NDArray[np.float64] | None = None
+    dx: NDArray[np.float64] | None = None
+    ddx: NDArray[np.float64] | None = None
 
 
 @dataclass(frozen=True)
@@ -106,8 +78,7 @@ class SecondOrderTimeModel(ABC):
     ``F(t, p) - N(t, x, dx, ddx, p) - M*ddx - C(p)*dx - K(p)*x = 0``.
     The continuation solver projects this time-domain residual into HB
     coefficient space. Models describe nonlinearities locally; the base class
-    scatters local forces and Jacobian terms to global DOFs for full-system
-    solvers.
+    projects local forces and Jacobian matrices into global HB space.
     """
 
     @property
@@ -145,15 +116,15 @@ class SecondOrderTimeModel(ABC):
         """Local nonlinear force samples shaped ``(samples, force_count)``."""
 
     @abstractmethod
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
-        """Nonzero local time-domain nonlinear Jacobian entries."""
+    ) -> LocalJacobianMatrices:
+        """Return batched local nonlinear Jacobian matrices."""
 
     def local_nonlinear_parameter_derivative(
         self,
@@ -194,43 +165,6 @@ class SecondOrderTimeModel(ABC):
         force = np.zeros((t.size, self.n_dof), dtype=np.float64)
         force[:, list(force_dofs)] = local_force
         return force
-
-    def nonlinear_jacobian_terms(
-        self,
-        t: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        parameter: float,
-    ) -> tuple[NonlinearJacobianTerm, ...]:
-        """Global nonlinear Jacobian terms generated from local terms."""
-
-        force_dofs = _validate_dofs("nonlinear_force_dofs", self.nonlinear_force_dofs, self.n_dof)
-        coordinate_dofs = _validate_dofs("nonlinear_coordinate_dofs", self.nonlinear_coordinate_dofs, self.n_dof)
-        local_x, local_dx, local_ddx = _extract_local_states(x, dx, ddx, coordinate_dofs)
-        terms = []
-        for term in self.local_nonlinear_jacobian_terms(t, local_x, local_dx, local_ddx, parameter):
-            if term.variable not in ("x", "dx", "ddx"):
-                raise ValueError(f"unsupported local nonlinear Jacobian variable {term.variable!r}")
-            if not (0 <= term.force_index < len(force_dofs)):
-                raise ValueError(f"local force_index out of range: {term.force_index}")
-            if not (0 <= term.coordinate_index < len(coordinate_dofs)):
-                raise ValueError(f"local coordinate_index out of range: {term.coordinate_index}")
-            values = np.asarray(term.values, dtype=np.float64).reshape(-1)
-            if values.shape[0] != t.size:
-                raise ValueError(
-                    "local nonlinear Jacobian term values must have one value per time sample; "
-                    f"got {values.shape[0]}, expected {t.size}"
-                )
-            terms.append(
-                NonlinearJacobianTerm(
-                    force_dofs[term.force_index],
-                    term.variable,
-                    coordinate_dofs[term.coordinate_index],
-                    values,
-                )
-            )
-        return tuple(terms)
 
     def nonlinear_parameter_derivative(
         self,
@@ -405,15 +339,15 @@ class AutodiffSecondOrderTimeModel(SecondOrderTimeModel):
             )
         return np.asarray(force.detach().cpu().numpy(), dtype=np.float64)
 
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
-        """Autodiff models do not expose handwritten nonlinear Jacobian terms."""
+    ) -> LocalJacobianMatrices:
+        """Autodiff models do not expose handwritten nonlinear Jacobian matrices."""
 
         raise NotImplementedError("use ContinuationAutodiffSolver for AutodiffSecondOrderTimeModel")
 
@@ -480,7 +414,7 @@ class FreeFrequencySecondOrderTimeModel(ABC):
         """Local generalized residual samples shaped ``(samples, force_count)``."""
 
     @abstractmethod
-    def local_residual_jacobian_terms(
+    def local_residual_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
@@ -488,8 +422,8 @@ class FreeFrequencySecondOrderTimeModel(ABC):
         local_ddx: NDArray[np.float64],
         omega: float,
         parameter: float,
-    ) -> tuple[LocalResidualJacobianTerm, ...]:
-        """Nonzero local time-domain generalized residual Jacobian entries."""
+    ) -> LocalJacobianMatrices:
+        """Return batched local generalized residual Jacobian matrices."""
 
     def local_residual_omega_derivative(
         self,
@@ -541,44 +475,6 @@ class FreeFrequencySecondOrderTimeModel(ABC):
         force = np.zeros((t.size, self.n_dof), dtype=np.float64)
         force[:, list(force_dofs)] = local_force
         return force
-
-    def residual_jacobian_terms(
-        self,
-        t: NDArray[np.float64],
-        x: NDArray[np.float64],
-        dx: NDArray[np.float64],
-        ddx: NDArray[np.float64],
-        omega: float,
-        parameter: float,
-    ) -> tuple[NonlinearJacobianTerm, ...]:
-        """Global generalized residual Jacobian terms generated from local terms."""
-
-        force_dofs = _validate_dofs("residual_force_dofs", self.residual_force_dofs, self.n_dof)
-        coordinate_dofs = _validate_dofs("residual_coordinate_dofs", self.residual_coordinate_dofs, self.n_dof)
-        local_x, local_dx, local_ddx = _extract_local_states(x, dx, ddx, coordinate_dofs)
-        terms = []
-        for term in self.local_residual_jacobian_terms(t, local_x, local_dx, local_ddx, omega, parameter):
-            if term.variable not in ("x", "dx", "ddx"):
-                raise ValueError(f"unsupported local residual Jacobian variable {term.variable!r}")
-            if not (0 <= term.force_index < len(force_dofs)):
-                raise ValueError(f"local force_index out of range: {term.force_index}")
-            if not (0 <= term.coordinate_index < len(coordinate_dofs)):
-                raise ValueError(f"local coordinate_index out of range: {term.coordinate_index}")
-            values = np.asarray(term.values, dtype=np.float64).reshape(-1)
-            if values.shape[0] != t.size:
-                raise ValueError(
-                    "local residual Jacobian term values must have one value per time sample; "
-                    f"got {values.shape[0]}, expected {t.size}"
-                )
-            terms.append(
-                NonlinearJacobianTerm(
-                    force_dofs[term.force_index],
-                    term.variable,
-                    coordinate_dofs[term.coordinate_index],
-                    values,
-                )
-            )
-        return tuple(terms)
 
     def residual_omega_derivative(
         self,
@@ -714,7 +610,7 @@ class AutodiffFreeFrequencySecondOrderTimeModel(FreeFrequencySecondOrderTimeMode
             )
         return np.asarray(force.detach().cpu().numpy(), dtype=np.float64)
 
-    def local_residual_jacobian_terms(
+    def local_residual_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
@@ -722,8 +618,8 @@ class AutodiffFreeFrequencySecondOrderTimeModel(FreeFrequencySecondOrderTimeMode
         local_ddx: NDArray[np.float64],
         omega: float,
         parameter: float,
-    ) -> tuple[LocalResidualJacobianTerm, ...]:
-        """Autodiff models do not expose handwritten residual Jacobian terms."""
+    ) -> LocalJacobianMatrices:
+        """Autodiff models do not expose handwritten residual Jacobian matrices."""
 
         raise NotImplementedError("use ContinuationFreeFrequencyAutodiffSolver")
 

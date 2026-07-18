@@ -16,7 +16,7 @@ from .models import (
     FreeFrequencySecondOrderTimeModel,
     JacobianVariable,
     LinearOperatorTerm,
-    NonlinearJacobianTerm,
+    LocalJacobianMatrices,
     SecondOrderTimeModel,
 )
 
@@ -55,6 +55,8 @@ def compute_floquet(
     """Compute Floquet multipliers for one analytical-model HB solution."""
 
     active_config = config or FloquetConfig()
+    _validate_config(active_config)
+    method = _resolve_method(active_config.method)
     samples = _prepare_solution_samples(
         model,
         coefficients,
@@ -63,23 +65,33 @@ def compute_floquet(
         frequency_resolution,
         active_config,
     )
-    jacobians = _sampled_jacobians_from_terms(
-        model.nonlinear_jacobian_terms(
-            samples.t,
-            samples.x,
-            samples.dx,
-            samples.ddx,
-            float(parameter),
-        ),
-        samples.t.size,
-        model.n_dof,
+    coordinate_dofs = tuple(model.nonlinear_coordinate_dofs)
+    jacobian = model.local_nonlinear_jacobian(
+        samples.t,
+        samples.x[:, list(coordinate_dofs)],
+        samples.dx[:, list(coordinate_dofs)],
+        samples.ddx[:, list(coordinate_dofs)],
+        float(parameter),
     )
-    return compute_floquet_from_sampled_jacobians(
-        model,
-        samples,
-        jacobians,
-        active_config,
-    )
+    if method == "exponential":
+        jacobians = dense_jacobians_from_local_matrices(
+            model.nonlinear_force_dofs,
+            coordinate_dofs,
+            jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        multipliers = _exponential_multipliers(model, samples, jacobians)
+    else:
+        jacobians = sampled_jacobians_from_local_matrices(
+            model.nonlinear_force_dofs,
+            coordinate_dofs,
+            jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        multipliers = _trapezoid_multipliers(model, samples, jacobians)
+    return _build_floquet_result(samples, multipliers, active_config, method)
 
 
 def compute_free_frequency_floquet(
@@ -94,6 +106,8 @@ def compute_free_frequency_floquet(
     """Compute Floquet multipliers for one free-frequency HB solution."""
 
     active_config = config or FloquetConfig()
+    _validate_config(active_config)
+    method = _resolve_method(active_config.method)
     samples = _prepare_solution_samples(
         model,
         coefficients,
@@ -102,24 +116,34 @@ def compute_free_frequency_floquet(
         frequency_resolution,
         active_config,
     )
-    jacobians = _sampled_jacobians_from_terms(
-        model.residual_jacobian_terms(
-            samples.t,
-            samples.x,
-            samples.dx,
-            samples.ddx,
-            float(omega),
-            float(parameter),
-        ),
-        samples.t.size,
-        model.n_dof,
+    coordinate_dofs = tuple(model.residual_coordinate_dofs)
+    jacobian = model.local_residual_jacobian(
+        samples.t,
+        samples.x[:, list(coordinate_dofs)],
+        samples.dx[:, list(coordinate_dofs)],
+        samples.ddx[:, list(coordinate_dofs)],
+        float(omega),
+        float(parameter),
     )
-    return compute_floquet_from_sampled_jacobians(
-        model,
-        samples,
-        jacobians,
-        active_config,
-    )
+    if method == "exponential":
+        jacobians = dense_jacobians_from_local_matrices(
+            model.residual_force_dofs,
+            coordinate_dofs,
+            jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        multipliers = _exponential_multipliers(model, samples, jacobians)
+    else:
+        jacobians = sampled_jacobians_from_local_matrices(
+            model.residual_force_dofs,
+            coordinate_dofs,
+            jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        multipliers = _trapezoid_multipliers(model, samples, jacobians)
+    return _build_floquet_result(samples, multipliers, active_config, method)
 
 
 @dataclass(frozen=True)
@@ -131,9 +155,13 @@ class _SolutionSamples:
     x: NDArray[np.float64]
     dx: NDArray[np.float64]
     ddx: NDArray[np.float64]
-    mass: sparse.csc_matrix
-    damping: sparse.csc_matrix
-    stiffness: sparse.csc_matrix
+
+
+@dataclass(frozen=True)
+class _DenseJacobianSamples:
+    force_dofs: tuple[int, ...]
+    coordinate_dofs: tuple[int, ...]
+    values: dict[JacobianVariable, NDArray[np.float64]]
 
 
 def prepare_solution_samples(
@@ -144,7 +172,7 @@ def prepare_solution_samples(
     frequency_resolution: float,
     config: FloquetConfig,
 ) -> _SolutionSamples:
-    """Reconstruct states and structured linear matrices for Floquet analysis."""
+    """Reconstruct the sampled HB state used by Floquet analysis."""
 
     return _prepare_solution_samples(
         model,
@@ -156,22 +184,44 @@ def prepare_solution_samples(
     )
 
 
-def compute_floquet_from_sampled_jacobians(
+def compute_floquet_from_sparse_jacobians(
     model: _StructuredHBModel,
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
     config: FloquetConfig,
 ) -> FloquetResult:
-    """Compute multipliers from precomputed time-domain nonlinear Jacobians."""
+    """Compute trapezoid multipliers from sampled sparse Jacobians."""
 
     _validate_config(config)
     method = _resolve_method(config.method)
-    if method == "trapezoid":
-        multipliers = _trapezoid_multipliers(samples, jacobians)
-    elif method == "exponential":
-        multipliers = _exponential_multipliers(samples, jacobians)
-    else:  # pragma: no cover - _resolve_method keeps this unreachable.
-        raise ValueError(f"unsupported Floquet method {method!r}")
+    if method != "trapezoid":
+        raise ValueError("sparse sampled Jacobians are only used by the trapezoid Floquet method")
+    multipliers = _trapezoid_multipliers(model, samples, jacobians)
+    return _build_floquet_result(samples, multipliers, config, method)
+
+
+def compute_floquet_from_dense_jacobians(
+    model: _StructuredHBModel,
+    samples: _SolutionSamples,
+    jacobians: _DenseJacobianSamples,
+    config: FloquetConfig,
+) -> FloquetResult:
+    """Compute exponential multipliers from compact dense Jacobians."""
+
+    _validate_config(config)
+    method = _resolve_method(config.method)
+    if method != "exponential":
+        raise ValueError("dense sampled Jacobians are only used by the exponential Floquet method")
+    multipliers = _exponential_multipliers(model, samples, jacobians)
+    return _build_floquet_result(samples, multipliers, config, method)
+
+
+def _build_floquet_result(
+    samples: _SolutionSamples,
+    multipliers: NDArray[np.complex128],
+    config: FloquetConfig,
+    method: str,
+) -> FloquetResult:
     spectral_radius = float(np.max(np.abs(multipliers))) if multipliers.size else 0.0
     stable = bool(spectral_radius <= 1.0 + float(config.stability_tolerance))
     _emit_progress(
@@ -209,11 +259,6 @@ def _prepare_solution_samples(
     x = hb_item @ coefficient_matrix
     dx = hb_item_dt @ coefficient_matrix
     ddx = hb_item_ddt @ coefficient_matrix
-    mass, damping, stiffness = _combine_sparse_time_operator_matrices(
-        model.linear_operator_terms(),
-        float(parameter),
-        model.n_dof,
-    )
     return _SolutionSamples(
         parameter=float(parameter),
         period=float(period),
@@ -222,70 +267,70 @@ def _prepare_solution_samples(
         x=x,
         dx=dx,
         ddx=ddx,
-        mass=mass,
-        damping=damping,
-        stiffness=stiffness,
     )
 
 
-def _sampled_jacobians_from_terms(
-    terms: Sequence[NonlinearJacobianTerm],
-    sample_count: int,
-    n_dof: int,
-) -> dict[JacobianVariable, tuple[sparse.csc_matrix, ...]]:
-    variables: tuple[JacobianVariable, ...] = ("x", "dx", "ddx")
-    rows: dict[JacobianVariable, list[list[int]]] = {
-        variable: [[] for _ in range(sample_count)] for variable in variables
-    }
-    cols: dict[JacobianVariable, list[list[int]]] = {
-        variable: [[] for _ in range(sample_count)] for variable in variables
-    }
-    data: dict[JacobianVariable, list[list[float]]] = {
-        variable: [[] for _ in range(sample_count)] for variable in variables
-    }
-    for term in terms:
-        variable = term.variable
-        if variable not in rows:
-            raise ValueError(f"unsupported nonlinear Jacobian variable {variable!r}")
-        values = np.asarray(term.values, dtype=np.float64).reshape(-1)
-        if values.shape[0] != sample_count:
-            raise ValueError(
-                "nonlinear Jacobian term values must have one value per Hsu sample; "
-                f"got {values.shape[0]}, expected {sample_count}"
-            )
-        for index, value in enumerate(values):
-            if value == 0.0:
-                continue
-            rows[variable][index].append(int(term.force_dof))
-            cols[variable][index].append(int(term.coordinate_dof))
-            data[variable][index].append(float(value))
-    return {
-        variable: tuple(
-            sparse.coo_matrix(
-                (data[variable][index], (rows[variable][index], cols[variable][index])),
-                shape=(n_dof, n_dof),
-                dtype=np.float64,
-            ).tocsc()
-            for index in range(sample_count)
-        )
-        for variable in variables
-    }
-
-
-def sampled_jacobians_from_local_arrays(
+def dense_jacobians_from_local_matrices(
     force_dofs: Sequence[int],
     coordinate_dofs: Sequence[int],
-    jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]],
+    jacobians: LocalJacobianMatrices,
+    sample_count: int,
+    n_dof: int,
+) -> _DenseJacobianSamples:
+    """Keep local Jacobian matrices in compact dense-coordinate form."""
+
+    force_indices = tuple(int(value) for value in force_dofs)
+    coordinate_indices = tuple(int(value) for value in coordinate_dofs)
+    _validate_dense_jacobian_dofs(force_indices, coordinate_indices, n_dof)
+    values = _empty_dense_jacobian_values(sample_count, len(force_indices), len(coordinate_indices))
+    expected_shape = (sample_count, len(force_indices), len(coordinate_indices))
+    for variable, variable_values in _local_jacobian_items(jacobians):
+        array = np.asarray(variable_values, dtype=np.float64)
+        if array.shape != expected_shape:
+            raise ValueError(f"dN/d{variable} must have shape {expected_shape}, got {array.shape}")
+        values[variable] = array
+    return _DenseJacobianSamples(force_indices, coordinate_indices, values)
+
+
+def _empty_dense_jacobian_values(
+    sample_count: int,
+    force_count: int,
+    coordinate_count: int,
+) -> dict[JacobianVariable, NDArray[np.float64]]:
+    shape = (sample_count, force_count, coordinate_count)
+    return {variable: np.zeros(shape, dtype=np.float64) for variable in ("x", "dx", "ddx")}
+
+
+def _validate_dense_jacobian_dofs(
+    force_dofs: tuple[int, ...],
+    coordinate_dofs: tuple[int, ...],
+    n_dof: int,
+) -> None:
+    for name, dofs in (("force_dofs", force_dofs), ("coordinate_dofs", coordinate_dofs)):
+        if len(set(dofs)) != len(dofs):
+            raise ValueError(f"{name} must not contain duplicates")
+        invalid = [dof for dof in dofs if not 0 <= dof < n_dof]
+        if invalid:
+            raise ValueError(f"{name} contains out-of-range entries: {invalid}")
+
+
+def sampled_jacobians_from_local_matrices(
+    force_dofs: Sequence[int],
+    coordinate_dofs: Sequence[int],
+    jacobians: LocalJacobianMatrices,
     sample_count: int,
     n_dof: int,
 ) -> dict[JacobianVariable, tuple[sparse.csc_matrix, ...]]:
-    """Scatter autodiff local Jacobian arrays to sampled global sparse matrices."""
+    """Scatter local Jacobian matrices to sampled global sparse matrices."""
 
+    if not isinstance(jacobians, LocalJacobianMatrices):
+        raise TypeError("local Jacobian method must return LocalJacobianMatrices")
     result: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]] = {}
     force_indices = tuple(int(value) for value in force_dofs)
     coordinate_indices = tuple(int(value) for value in coordinate_dofs)
+    _validate_dense_jacobian_dofs(force_indices, coordinate_indices, n_dof)
     for variable in ("x", "dx", "ddx"):
-        values = jacobian_by_variable.get(variable)
+        values = getattr(jacobians, variable)
         if values is None:
             result[variable] = tuple(sparse.csc_matrix((n_dof, n_dof), dtype=np.float64) for _ in range(sample_count))
             continue
@@ -314,28 +359,52 @@ def sampled_jacobians_from_local_arrays(
     return result
 
 
+def _local_jacobian_items(
+    jacobians: LocalJacobianMatrices,
+) -> tuple[tuple[JacobianVariable, NDArray[np.float64]], ...]:
+    if not isinstance(jacobians, LocalJacobianMatrices):
+        raise TypeError("local Jacobian method must return LocalJacobianMatrices")
+    return tuple(
+        (variable, values)
+        for variable, values in (("x", jacobians.x), ("dx", jacobians.dx), ("ddx", jacobians.ddx))
+        if values is not None
+    )
+
+
 def _exponential_multipliers(
+    model: _StructuredHBModel,
     samples: _SolutionSamples,
-    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
+    jacobians: _DenseJacobianSamples,
 ) -> NDArray[np.complex128]:
-    state_dim = 2 * samples.mass.shape[0]
+    mass_base, damping_base, stiffness_base = _combine_dense_time_operator_matrices(
+        model.linear_operator_terms(),
+        float(samples.parameter),
+        model.n_dof,
+    )
+    state_dim = 2 * model.n_dof
     monodromy = np.eye(state_dim, dtype=np.float64)
     for sample_index in range(samples.t.size):
-        state_matrix = _dense_state_matrix(samples, jacobians, sample_index)
+        mass = _add_dense_jacobian(mass_base, jacobians, "ddx", sample_index)
+        damping = _add_dense_jacobian(damping_base, jacobians, "dx", sample_index)
+        stiffness = _add_dense_jacobian(stiffness_base, jacobians, "x", sample_index)
+        state_matrix = _dense_state_matrix(mass, damping, stiffness)
         monodromy = linalg.expm(state_matrix * samples.dt) @ monodromy
     return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
 
 
 def _trapezoid_multipliers(
+    model: _StructuredHBModel,
     samples: _SolutionSamples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
 ) -> NDArray[np.complex128]:
-    mass_base = samples.mass
-    damping_base = samples.damping
-    stiffness_base = samples.stiffness
+    mass_base, damping_base, stiffness_base = _combine_sparse_time_operator_matrices(
+        model.linear_operator_terms(),
+        float(samples.parameter),
+        model.n_dof,
+    )
     dt = float(samples.dt)
-    identity = sparse.identity(samples.mass.shape[0], format="csc", dtype=np.float64)
-    monodromy = np.eye(2 * samples.mass.shape[0], dtype=np.float64)
+    identity = sparse.identity(model.n_dof, format="csc", dtype=np.float64)
+    monodromy = np.eye(2 * model.n_dof, dtype=np.float64)
     for sample_index in range(samples.t.size):
         mass = mass_base + jacobians["ddx"][sample_index]
         damping = damping_base + jacobians["dx"][sample_index]
@@ -359,20 +428,29 @@ def _trapezoid_multipliers(
 
 
 def _dense_state_matrix(
-    samples: _SolutionSamples,
-    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
-    sample_index: int,
+    mass: NDArray[np.float64],
+    damping: NDArray[np.float64],
+    stiffness: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    n_dof = samples.mass.shape[0]
-    mass = (samples.mass + jacobians["ddx"][sample_index]).toarray()
-    damping = (samples.damping + jacobians["dx"][sample_index]).toarray()
-    stiffness = (samples.stiffness + jacobians["x"][sample_index]).toarray()
+    n_dof = mass.shape[0]
     solved = linalg.solve(mass, np.column_stack((stiffness, damping)), assume_a="gen")
     state_matrix = np.zeros((2 * n_dof, 2 * n_dof), dtype=np.float64)
     state_matrix[:n_dof, n_dof:] = np.eye(n_dof, dtype=np.float64)
     state_matrix[n_dof:, :n_dof] = -solved[:, :n_dof]
     state_matrix[n_dof:, n_dof:] = -solved[:, n_dof:]
     return state_matrix
+
+
+def _add_dense_jacobian(
+    base: NDArray[np.float64],
+    jacobians: _DenseJacobianSamples,
+    variable: JacobianVariable,
+    sample_index: int,
+) -> NDArray[np.float64]:
+    matrix = base.copy()
+    if jacobians.force_dofs and jacobians.coordinate_dofs:
+        matrix[np.ix_(jacobians.force_dofs, jacobians.coordinate_dofs)] += jacobians.values[variable][sample_index]
+    return matrix
 
 
 def _resolve_method(method: str) -> str:
@@ -399,6 +477,26 @@ def _combine_sparse_time_operator_matrices(
             raise ValueError(f"linear operator matrix must have shape {(n_dof, n_dof)}, got {matrix.shape}")
         matrices[term.basis_type] = matrices[term.basis_type] + float(parameter) ** float(term.omega_power) * matrix
     return matrices["ddx"].tocsc(), matrices["dx"].tocsc(), matrices["x"].tocsc()
+
+
+def _combine_dense_time_operator_matrices(
+    terms: Sequence[LinearOperatorTerm],
+    parameter: float,
+    n_dof: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    matrices = {
+        "ddx": np.zeros((n_dof, n_dof), dtype=np.float64),
+        "dx": np.zeros((n_dof, n_dof), dtype=np.float64),
+        "x": np.zeros((n_dof, n_dof), dtype=np.float64),
+    }
+    for term in terms:
+        if term.basis_type not in matrices:
+            raise ValueError(f"unsupported linear operator basis_type: {term.basis_type!r}")
+        matrix = term.matrix.toarray() if sparse.issparse(term.matrix) else np.asarray(term.matrix, dtype=np.float64)
+        if matrix.shape != (n_dof, n_dof):
+            raise ValueError(f"linear operator matrix must have shape {(n_dof, n_dof)}, got {matrix.shape}")
+        matrices[term.basis_type] += float(parameter) ** float(term.omega_power) * matrix
+    return matrices["ddx"], matrices["dx"], matrices["x"]
 
 
 def _emit_progress(config: FloquetConfig, message: str) -> None:

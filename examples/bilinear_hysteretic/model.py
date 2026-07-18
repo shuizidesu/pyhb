@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
+from pyhb import ForcingTerm, LinearOperatorTerm, LocalJacobianMatrices, SecondOrderTimeModel
 
 
 @dataclass(frozen=True)
@@ -66,18 +66,18 @@ class BilinearHystereticModel(SecondOrderTimeModel):
         force, _ = self._piecewise_force_and_slope(y, dy)
         return force.reshape(-1, 1)
 
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+    ) -> LocalJacobianMatrices:
         y = local_x[:, 0]
         dy = local_dx[:, 0]
         _, slope = self._piecewise_force_and_slope(y, dy)
-        return (LocalNonlinearJacobianTerm(0, "x", 0, slope),)
+        return LocalJacobianMatrices(x=slope.reshape(-1, 1, 1))
 
     def _piecewise_force_and_slope(
         self,

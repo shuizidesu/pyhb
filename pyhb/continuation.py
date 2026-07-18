@@ -16,7 +16,6 @@ from .continuation_core import (
     _combine_powered_dense_blocks,
     _combine_powered_sparse_blocks,
     _evaluate_local_state,
-    _local_jacobian_terms_to_global,
     _local_samples_to_global_coefficients,
     _parameter_step_too_large,
     _PoweredEvaluation,
@@ -30,7 +29,7 @@ from .continuation_core import (
     _validate_optional_positive_scale,
     _validate_positive_scale,
     _validated_dofs,
-    assemble_hb_jacobian_from_terms,
+    assemble_hb_jacobian_from_local_matrices,
 )
 from .harmonics import flatten_coefficients
 from .models import SecondOrderTimeModel
@@ -211,28 +210,21 @@ class ContinuationSolver:
             "local nonlinear force",
         )
 
-        local_terms = tuple(
-            self.model.local_nonlinear_jacobian_terms(
-                self.prepared.t,
-                local_x,
-                local_dx,
-                local_ddx,
-                parameter,
-            )
+        local_jacobian = self.model.local_nonlinear_jacobian(
+            self.prepared.t,
+            local_x,
+            local_dx,
+            local_ddx,
+            parameter,
         )
-        global_terms = _local_jacobian_terms_to_global(
-            local_terms,
+        nonlinear_jacobian = assemble_hb_jacobian_from_local_matrices(
+            local_jacobian,
             force_dofs,
             coordinate_dofs,
-            self.prepared.t.size,
-            self.model.n_dof,
-            "local nonlinear",
-        )
-        nonlinear_jacobian = assemble_hb_jacobian_from_terms(
-            global_terms,
             self.prepared.context,
             self.prepared.t.size,
             self.model.n_dof,
+            "local nonlinear",
         )
         parameter_coefficients = None
         if include_parameter:

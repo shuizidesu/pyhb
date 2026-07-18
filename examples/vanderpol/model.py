@@ -9,7 +9,7 @@ from pyhb import (
     ForcingTerm,
     FreeFrequencySecondOrderTimeModel,
     LinearOperatorTerm,
-    LocalResidualJacobianTerm,
+    LocalJacobianMatrices,
 )
 
 
@@ -60,7 +60,7 @@ class VanderpolModel(FreeFrequencySecondOrderTimeModel):
         generalized = -float(parameter) * float(omega) * (lambda_value - displacement**2) * velocity
         return generalized.reshape(-1, 1)
 
-    def local_residual_jacobian_terms(
+    def local_residual_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
@@ -68,23 +68,15 @@ class VanderpolModel(FreeFrequencySecondOrderTimeModel):
         local_ddx: NDArray[np.float64],
         omega: float,
         parameter: float,
-    ) -> tuple[LocalResidualJacobianTerm, ...]:
+    ) -> LocalJacobianMatrices:
         displacement = local_x[:, 0]
         velocity = local_dx[:, 0]
         lambda_value = float(self.parameters.lambda_value)
-        return (
-            LocalResidualJacobianTerm(
-                0,
-                "x",
-                0,
-                2.0 * float(parameter) * float(omega) * displacement * velocity,
-            ),
-            LocalResidualJacobianTerm(
-                0,
-                "dx",
-                0,
-                -float(parameter) * float(omega) * (lambda_value - displacement**2),
-            ),
+        return LocalJacobianMatrices(
+            x=(2.0 * float(parameter) * float(omega) * displacement * velocity).reshape(-1, 1, 1),
+            dx=(
+                -float(parameter) * float(omega) * (lambda_value - displacement**2)
+            ).reshape(-1, 1, 1),
         )
 
     def local_residual_omega_derivative(

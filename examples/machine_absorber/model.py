@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
+from pyhb import ForcingTerm, LinearOperatorTerm, LocalJacobianMatrices, SecondOrderTimeModel
 
 
 @dataclass(frozen=True)
@@ -89,14 +89,14 @@ class MachineAbsorberModel(SecondOrderTimeModel):
         )
         return np.column_stack((f1, f2))
 
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+    ) -> LocalJacobianMatrices:
         x = local_x[:, 0]
         y = local_x[:, 1]
         parameters = self.parameters
@@ -106,7 +106,7 @@ class MachineAbsorberModel(SecondOrderTimeModel):
             -8.0 * float(parameters.alpha) * float(parameters.epsilon) * np.abs(y)
             + 3.0 * float(parameters.alpha) * float(parameters.epsilon) ** 2 * y**2
         )
-        return (
-            LocalNonlinearJacobianTerm(0, "x", 0, df1_dx),
-            LocalNonlinearJacobianTerm(1, "x", 1, df2_dy),
-        )
+        jacobian_x = np.zeros((t.size, 2, 2), dtype=np.float64)
+        jacobian_x[:, 0, 0] = df1_dx
+        jacobian_x[:, 1, 1] = df2_dy
+        return LocalJacobianMatrices(x=jacobian_x)

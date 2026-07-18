@@ -20,12 +20,17 @@ from .autodiff_utils import _resolve_torch_device, _validate_autodiff_variables
 from .floquet import (
     FloquetConfig,
     FloquetResult,
+    _DenseJacobianSamples,
+    _add_dense_jacobian,
+    _combine_dense_time_operator_matrices,
+    _combine_sparse_time_operator_matrices,
     _emit_progress,
     _resolve_method,
     _stability_label,
     _validate_config,
+    dense_jacobians_from_local_matrices,
     prepare_solution_samples,
-    sampled_jacobians_from_local_arrays,
+    sampled_jacobians_from_local_matrices,
 )
 from .floquet_autodiff import _autodiff_jacobians
 from .models import AutodiffSecondOrderTimeModel, JacobianVariable
@@ -75,7 +80,7 @@ def compute_mixed_order_floquet_autodiff(
         frequency_resolution,
         active_config,
     )
-    jacobian_by_variable = _autodiff_jacobians(
+    local_jacobian = _autodiff_jacobians(
         model,
         samples.t,
         samples.x[:, list(model.nonlinear_coordinate_dofs)],
@@ -85,17 +90,24 @@ def compute_mixed_order_floquet_autodiff(
         variables,
         device,
     )
-    sampled_jacobians = sampled_jacobians_from_local_arrays(
-        model.nonlinear_force_dofs,
-        model.nonlinear_coordinate_dofs,
-        jacobian_by_variable,
-        samples.t.size,
-        model.n_dof,
-    )
     if method == "trapezoid":
-        multipliers = _mixed_trapezoid_multipliers(samples, sampled_jacobians, layout)
+        jacobians = sampled_jacobians_from_local_matrices(
+            model.nonlinear_force_dofs,
+            model.nonlinear_coordinate_dofs,
+            local_jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        multipliers = _mixed_trapezoid_multipliers(model, samples, jacobians, layout)
     elif method == "exponential":
-        multipliers = _mixed_exponential_multipliers(samples, sampled_jacobians, layout)
+        jacobians = dense_jacobians_from_local_matrices(
+            model.nonlinear_force_dofs,
+            model.nonlinear_coordinate_dofs,
+            local_jacobian,
+            samples.t.size,
+            model.n_dof,
+        )
+        multipliers = _mixed_exponential_multipliers(model, samples, jacobians, layout)
     else:  # pragma: no cover - _resolve_method keeps this unreachable.
         raise ValueError(f"unsupported Floquet method {method!r}")
     spectral_radius = float(np.max(np.abs(multipliers))) if multipliers.size else 0.0
@@ -116,14 +128,25 @@ def compute_mixed_order_floquet_autodiff(
 
 
 def _mixed_trapezoid_multipliers(
+    model: AutodiffSecondOrderTimeModel,
     samples,
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
     layout: _MixedOrderLayout,
 ) -> NDArray[np.complex128]:
+    operator_matrices = _combine_sparse_time_operator_matrices(
+        model.linear_operator_terms(),
+        float(samples.parameter),
+        model.n_dof,
+    )
     monodromy = np.eye(layout.state_dim, dtype=np.float64)
     dt = float(samples.dt)
     for sample_index in range(samples.t.size):
-        descriptor, state_matrix = _mixed_descriptor_matrices(samples, jacobians, sample_index, layout)
+        descriptor, state_matrix = _mixed_sparse_descriptor_matrices(
+            operator_matrices,
+            jacobians,
+            sample_index,
+            layout,
+        )
         left = (descriptor - 0.5 * dt * state_matrix).tocsc()
         right = (descriptor + 0.5 * dt * state_matrix).tocsc()
         try:
@@ -134,23 +157,38 @@ def _mixed_trapezoid_multipliers(
 
 
 def _mixed_exponential_multipliers(
+    model: AutodiffSecondOrderTimeModel,
     samples,
-    jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
+    jacobians: _DenseJacobianSamples,
     layout: _MixedOrderLayout,
 ) -> NDArray[np.complex128]:
+    mass_base, damping_base, stiffness_base = _combine_dense_time_operator_matrices(
+        model.linear_operator_terms(),
+        float(samples.parameter),
+        model.n_dof,
+    )
     monodromy = np.eye(layout.state_dim, dtype=np.float64)
     for sample_index in range(samples.t.size):
-        descriptor, state_matrix = _mixed_descriptor_matrices(samples, jacobians, sample_index, layout)
+        mass = _add_dense_jacobian(mass_base, jacobians, "ddx", sample_index)
+        damping = _add_dense_jacobian(damping_base, jacobians, "dx", sample_index)
+        stiffness = _add_dense_jacobian(stiffness_base, jacobians, "x", sample_index)
+        descriptor, state_matrix = _mixed_dense_descriptor_matrices(
+            mass,
+            damping,
+            stiffness,
+            sample_index,
+            layout,
+        )
         try:
-            generator = linalg.solve(descriptor.toarray(), state_matrix.toarray(), assume_a="gen")
+            generator = linalg.solve(descriptor, state_matrix, assume_a="gen")
         except linalg.LinAlgError as exc:
             raise ValueError(f"mixed-order exponential Floquet descriptor {sample_index} is singular") from exc
         monodromy = linalg.expm(generator * float(samples.dt)) @ monodromy
     return np.asarray(linalg.eigvals(monodromy), dtype=np.complex128)
 
 
-def _mixed_descriptor_matrices(
-    samples,
+def _mixed_sparse_descriptor_matrices(
+    operator_matrices: tuple[sparse.csc_matrix, sparse.csc_matrix, sparse.csc_matrix],
     jacobians: dict[JacobianVariable, tuple[sparse.csc_matrix, ...]],
     sample_index: int,
     layout: _MixedOrderLayout,
@@ -161,9 +199,10 @@ def _mixed_descriptor_matrices(
     n_first = len(first)
     n_dof = layout.n_dof
 
-    mass = samples.mass + jacobians["ddx"][sample_index]
-    damping = samples.damping + jacobians["dx"][sample_index]
-    stiffness = samples.stiffness + jacobians["x"][sample_index]
+    mass_base, damping_base, stiffness_base = operator_matrices
+    mass = mass_base + jacobians["ddx"][sample_index]
+    damping = damping_base + jacobians["dx"][sample_index]
+    stiffness = stiffness_base + jacobians["x"][sample_index]
     _validate_no_first_order_acceleration(mass[:, first], sample_index)
 
     identity_second = sparse.identity(n_second, format="csc", dtype=np.float64)
@@ -178,6 +217,30 @@ def _mixed_descriptor_matrices(
     state_top = sparse.hstack((zero_ss, identity_second, zero_sf), format="csc")
     state_bottom = sparse.hstack((-stiffness[:, second], -damping[:, second], -stiffness[:, first]), format="csc")
     state_matrix = sparse.vstack((state_top, state_bottom), format="csc")
+    return descriptor, state_matrix
+
+
+def _mixed_dense_descriptor_matrices(
+    mass: NDArray[np.float64],
+    damping: NDArray[np.float64],
+    stiffness: NDArray[np.float64],
+    sample_index: int,
+    layout: _MixedOrderLayout,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    second = list(layout.second_order_dofs)
+    first = list(layout.first_order_dofs)
+    n_second = len(second)
+
+    _validate_no_first_order_acceleration_dense(mass[:, first], sample_index)
+    descriptor = np.zeros((layout.state_dim, layout.state_dim), dtype=np.float64)
+    state_matrix = np.zeros_like(descriptor)
+    descriptor[:n_second, :n_second] = np.eye(n_second, dtype=np.float64)
+    descriptor[n_second:, n_second : 2 * n_second] = mass[:, second]
+    descriptor[n_second:, 2 * n_second :] = damping[:, first]
+    state_matrix[:n_second, n_second : 2 * n_second] = np.eye(n_second, dtype=np.float64)
+    state_matrix[n_second:, :n_second] = -stiffness[:, second]
+    state_matrix[n_second:, n_second : 2 * n_second] = -damping[:, second]
+    state_matrix[n_second:, 2 * n_second :] = -stiffness[:, first]
     return descriptor, state_matrix
 
 
@@ -212,6 +275,20 @@ def _validate_no_first_order_acceleration(block: sparse.spmatrix, sample_index: 
     if block.nnz == 0:
         return
     max_abs = float(np.max(np.abs(block.data)))
+    if max_abs > 1e-12:
+        raise ValueError(
+            "mixed-order Floquet does not support second-derivative terms on first_order_dofs; "
+            f"sample={sample_index}, max_abs={max_abs:.6e}"
+        )
+
+
+def _validate_no_first_order_acceleration_dense(
+    block: NDArray[np.float64],
+    sample_index: int,
+) -> None:
+    if block.size == 0:
+        return
+    max_abs = float(np.max(np.abs(block)))
     if max_abs > 1e-12:
         raise ValueError(
             "mixed-order Floquet does not support second-derivative terms on first_order_dofs; "

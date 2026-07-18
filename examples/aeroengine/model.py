@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.io import loadmat
 
-from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
+from pyhb import ForcingTerm, LinearOperatorTerm, LocalJacobianMatrices, SecondOrderTimeModel
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "aero_engine_system_parameter_matrix.mat"
 
@@ -134,14 +134,14 @@ class AeroEngineRotorModel(SecondOrderTimeModel):
         fx, fy, _ = self._bearing_force_and_partials_from_local(t, local_x)
         return np.column_stack((fx, -fx, fy, -fy))
 
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+    ) -> LocalJacobianMatrices:
         _, _, partials = self._bearing_force_and_partials_from_local(t, local_x)
         dfx_dx, dfx_dy, dfy_dx, dfy_dy = partials
         partial_rows = (
@@ -150,11 +150,11 @@ class AeroEngineRotorModel(SecondOrderTimeModel):
             (dfy_dx, -dfy_dx, dfy_dy, -dfy_dy),
             (-dfy_dx, dfy_dx, -dfy_dy, dfy_dy),
         )
-        return tuple(
-            LocalNonlinearJacobianTerm(row, "x", column, values)
-            for row, row_values in enumerate(partial_rows)
-            for column, values in enumerate(row_values)
+        jacobian_x = np.stack(
+            tuple(np.column_stack(row_values) for row_values in partial_rows),
+            axis=1,
         )
+        return LocalJacobianMatrices(x=jacobian_x)
 
     def _bearing_force_and_partials_from_local(
         self,

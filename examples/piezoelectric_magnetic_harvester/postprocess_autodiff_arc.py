@@ -76,9 +76,9 @@ def save_plot(
     axes_array = np.atleast_1d(axes)
     for axis, column, dof in zip(axes_array, range(len(dofs)), dofs, strict=True):
         values = rms_history[:, column]
-        if dof == 1:
+        if (dof == 0) or (dof == 1):
             values = values * 1e3
-            ylabel = "z2 RMS [mm]"
+            ylabel = f"DOF {dof + 1} RMS"
         elif dof == 2:
             ylabel = "u RMS [V]"
         else:

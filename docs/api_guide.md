@@ -223,16 +223,16 @@ Required model properties and methods:
   grid.
 - `local_nonlinear_force(t, local_x, local_dx, local_ddx, parameter)`: returns
   nonlinear force samples shaped `(samples, len(nonlinear_force_dofs))`.
-- `local_nonlinear_jacobian_terms(...)`: returns local analytical nonlinear
-  Jacobian samples.
+- `local_nonlinear_jacobian(...)`: returns local analytical Jacobian matrices
+  as `LocalJacobianMatrices`.
 
 Optional method:
 
 - `local_nonlinear_parameter_derivative(...)`: returns explicit
   `dN/dparameter` samples. The default is zero.
 
-The base class scatters local nonlinear force and Jacobian data to global DOFs
-for full-system solvers.
+The solver projects and scatters local nonlinear force and Jacobian data to
+global DOFs.
 
 ### LinearOperatorTerm
 
@@ -265,25 +265,29 @@ Fields:
 - `omega_power`: exponent applied to the response frequency before the
   force contribution is assembled.
 
-### LocalNonlinearJacobianTerm
+### LocalJacobianMatrices
 
 ```python
-from pyhb import LocalNonlinearJacobianTerm
+from pyhb import LocalJacobianMatrices
 
-LocalNonlinearJacobianTerm(
-    force_index=0,
-    variable="x",
-    coordinate_index=0,
-    values=dndx_samples,
+LocalJacobianMatrices(
+    x=dndx_samples,
+    dx=dnddx_samples,
+    ddx=None,
 )
 ```
 
 Fields:
 
-- `force_index`: index inside `nonlinear_force_dofs`.
-- `variable`: one of `"x"`, `"dx"`, or `"ddx"`.
-- `coordinate_index`: index inside `nonlinear_coordinate_dofs`.
-- `values`: one sampled scalar derivative per solver time sample.
+- `x`: optional batched `dN/dx` matrix.
+- `dx`: optional batched `dN/d(dx)` matrix.
+- `ddx`: optional batched `dN/d(ddx)` matrix.
+
+Every non-`None` array has shape
+`(samples, len(nonlinear_force_dofs), len(nonlinear_coordinate_dofs))`.
+The `dx` and `ddx` fields refer to derivatives on the dimensionless HB
+phase-time grid. Omit a field with `None` when the nonlinear law does not
+depend on that variable.
 
 ## Autodiff Models
 
@@ -415,8 +419,8 @@ Required free-frequency model metadata:
 - `residual_force_dofs`: global equation rows where `G` is applied.
 - `residual_coordinate_dofs`: global coordinates whose `x/dx/ddx` enter `G`.
 - `local_residual_force(...)`: local samples of `G`.
-- `local_residual_jacobian_terms(...)`: local samples of `dG/dx`,
-  `dG/d(dx)`, and `dG/d(ddx)`.
+- `local_residual_jacobian(...)`: returns `LocalJacobianMatrices` containing
+  local samples of `dG/dx`, `dG/d(dx)`, and `dG/d(ddx)`.
 
 Optional derivatives default to zero:
 
@@ -491,9 +495,9 @@ Floquet backend after nonlinear Jacobian samples have been prepared.
 `compute_floquet(...)`:
 
 - reconstructs `x`, `dx`, and `ddx` at Hsu sample midpoints;
-- calls `model.nonlinear_jacobian_terms(...)`;
-- scatters the analytical sampled Jacobian terms into sparse matrices for
-  derivatives with respect to `x`, `dx`, and `ddx`.
+- calls `model.local_nonlinear_jacobian(...)`;
+- consumes the same compact local Jacobian matrices used by the continuation
+  solver.
 
 `compute_floquet_autodiff(...)`:
 

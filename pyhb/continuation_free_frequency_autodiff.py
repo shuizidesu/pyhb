@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from scipy import sparse
 from torch.func import jacfwd, jacrev
 
 from .autodiff_utils import (
@@ -17,14 +16,17 @@ from .autodiff_utils import (
     _to_numpy,
     _validate_autodiff_variables,
 )
-from .continuation_core import _local_samples_to_global_coefficients, _validated_dofs
+from .continuation_core import (
+    _local_samples_to_global_coefficients,
+    _validated_dofs,
+    assemble_hb_jacobian_from_local_matrices,
+)
 from .continuation_free_frequency import (
     ContinuationFreeFrequencyConfig,
     ContinuationFreeFrequencySolver,
     _GeneralizedEvaluation,
 )
-from .harmonics import coefficient_matrix_from_fft
-from .models import AutodiffFreeFrequencySecondOrderTimeModel, JacobianVariable
+from .models import AutodiffFreeFrequencySecondOrderTimeModel, JacobianVariable, LocalJacobianMatrices
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,7 @@ class ContinuationFreeFrequencyAutodiffConfig(ContinuationFreeFrequencyConfig):
 @dataclass(frozen=True)
 class _FreeAutodiffLocalEvaluation:
     force_samples: NDArray[np.float64]
-    jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]]
+    jacobian: LocalJacobianMatrices
     omega_derivative: NDArray[np.float64]
     parameter_derivative: NDArray[np.float64]
 
@@ -94,10 +96,14 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
             self.model.n_dof,
             "local residual force",
         )
-        generalized_jacobian = self._generalized_jacobian_from_values(
-            local.jacobian_by_variable,
+        generalized_jacobian = assemble_hb_jacobian_from_local_matrices(
+            local.jacobian,
             force_dofs,
             coordinate_dofs,
+            self.prepared.context,
+            self.prepared.t.size,
+            self.model.n_dof,
+            "local residual",
         )
         omega_coefficients = _local_samples_to_global_coefficients(
             local.omega_derivative,
@@ -123,55 +129,6 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
             omega_coefficients,
             parameter_coefficients,
         )
-
-    def _generalized_jacobian_from_values(
-        self,
-        jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]],
-        force_dofs: tuple[int, ...],
-        coordinate_dofs: tuple[int, ...],
-    ) -> sparse.csc_matrix:
-        context = self.prepared.context
-        order = context.order
-        size = self.model.n_dof * order
-        if not jacobian_by_variable:
-            return sparse.csc_matrix((size, size), dtype=np.float64)
-
-        s3_by_variable = {
-            "x": context.s3,
-            "dx": context.s3_dx,
-            "ddx": context.s3_ddx,
-        }
-        force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
-        coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
-        force_count = force_dofs_array.size
-        coordinate_count = coordinate_dofs_array.size
-        force_columns = np.repeat(force_dofs_array, coordinate_count)
-        coordinate_columns = np.tile(coordinate_dofs_array, force_count)
-        local_rows = np.tile(np.arange(order, dtype=np.int64), order)
-        local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
-
-        row_chunks: list[NDArray[np.int64]] = []
-        col_chunks: list[NDArray[np.int64]] = []
-        data_chunks: list[NDArray[np.float64]] = []
-        for variable, values in jacobian_by_variable.items():
-            flat_values = values.reshape(values.shape[0], force_count * coordinate_count)
-            coeffs = coefficient_matrix_from_fft(
-                flat_values,
-                context.nonlinear_harmonics,
-                context.sample_count,
-                context.nonlinear_harmonic_indices,
-            )
-            term_blocks_flat = (s3_by_variable[variable] @ coeffs).T
-            row_indices = force_columns[:, None] * order + local_rows[None, :]
-            col_indices = coordinate_columns[:, None] * order + local_cols[None, :]
-            row_chunks.append(row_indices.reshape(-1))
-            col_chunks.append(col_indices.reshape(-1))
-            data_chunks.append(term_blocks_flat.reshape(-1))
-
-        rows = np.concatenate(row_chunks)
-        cols = np.concatenate(col_chunks)
-        data = np.concatenate(data_chunks)
-        return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
 
     def _autodiff_values(
         self,
@@ -242,12 +199,12 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
                 "local residual parameter derivative must have shape "
                 f"{expected_force_shape}, got {parameter_derivative.shape}"
             )
-        return _FreeAutodiffLocalEvaluation(
-            force_samples,
-            jacobian_by_variable,
-            omega_derivative,
-            parameter_derivative,
+        jacobian = LocalJacobianMatrices(
+            x=jacobian_by_variable.get("x"),
+            dx=jacobian_by_variable.get("dx"),
+            ddx=jacobian_by_variable.get("ddx"),
         )
+        return _FreeAutodiffLocalEvaluation(force_samples, jacobian, omega_derivative, parameter_derivative)
 
     def _call_torch_force(
         self,

@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.io import loadmat
 
-from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
+from pyhb import ForcingTerm, LinearOperatorTerm, LocalJacobianMatrices, SecondOrderTimeModel
 
 DEFAULT_MATRIX_PATH = Path(__file__).resolve().parent / "data" / "beam_parameter_matrix.mat"
 
@@ -81,29 +81,21 @@ class BernoulliBeamModel(SecondOrderTimeModel):
         )
         return nonlinear_force.reshape(-1, 1)
 
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+    ) -> LocalJacobianMatrices:
         displacement = local_x[:, 0]
         velocity = local_dx[:, 0]
-        return (
-            LocalNonlinearJacobianTerm(
-                0,
-                "x",
-                0,
-                3.0 * float(self.parameters.kappa) * displacement**2,
-            ),
-            LocalNonlinearJacobianTerm(
-                0,
-                "dx",
-                0,
-                3.0 * float(self.parameters.gamma) * float(parameter) ** 3 * velocity**2,
-            ),
+        return LocalJacobianMatrices(
+            x=(3.0 * float(self.parameters.kappa) * displacement**2).reshape(-1, 1, 1),
+            dx=(
+                3.0 * float(self.parameters.gamma) * float(parameter) ** 3 * velocity**2
+            ).reshape(-1, 1, 1),
         )
 
     def local_nonlinear_parameter_derivative(

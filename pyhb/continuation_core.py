@@ -13,7 +13,7 @@ from scipy.sparse.linalg import splu
 
 from .harmonics import coefficient_matrix_from_fft, generate_hb_items, stack_fft_coefficients
 from .hb_operators import FrequencyGrid, HBContext, harmonic_integral_matrices
-from .models import ForcingTerm, LinearOperatorTerm, NonlinearJacobianTerm
+from .models import ForcingTerm, LinearOperatorTerm, LocalJacobianMatrices
 
 
 class _StructuredHBModel(Protocol):
@@ -111,70 +111,75 @@ class _BorderedArcSolve:
     tangent_candidate: NDArray[np.float64]
 
 
-def assemble_hb_jacobian_from_terms(
-    terms: tuple[NonlinearJacobianTerm, ...],
+def assemble_hb_jacobian_from_local_matrices(
+    jacobians: LocalJacobianMatrices,
+    force_dofs: Sequence[int],
+    coordinate_dofs: Sequence[int],
     context: HBContext,
     sample_count: int,
     n_dof: int,
+    label: str,
 ) -> sparse.csc_matrix:
-    """Assemble time-domain local Jacobian samples into a global HB Jacobian."""
+    """Project batched local Jacobian matrices and scatter them into HB space."""
 
     order = context.order
     size = n_dof * order
-    if not terms:
+    if not isinstance(jacobians, LocalJacobianMatrices):
+        raise TypeError(f"{label} must return LocalJacobianMatrices")
+
+    force_dofs = _validated_dofs("force_dofs", force_dofs, n_dof)
+    coordinate_dofs = _validated_dofs("coordinate_dofs", coordinate_dofs, n_dof)
+    force_count = len(force_dofs)
+    coordinate_count = len(coordinate_dofs)
+    expected_shape = (sample_count, force_count, coordinate_count)
+    active: list[tuple[str, NDArray[np.float64], NDArray[np.float64]]] = []
+    for variable, values, s3_matrix in (
+        ("x", jacobians.x, context.s3),
+        ("dx", jacobians.dx, context.s3_dx),
+        ("ddx", jacobians.ddx, context.s3_ddx),
+    ):
+        if values is None:
+            continue
+        array = np.asarray(values, dtype=np.float64)
+        if array.shape != expected_shape:
+            raise ValueError(f"{label} {variable} Jacobian must have shape {expected_shape}, got {array.shape}")
+        active.append((variable, array, s3_matrix))
+
+    if not active or force_count == 0 or coordinate_count == 0:
         return sparse.csc_matrix((size, size), dtype=np.float64)
 
-    s3_by_variable = {
-        "x": context.s3,
-        "dx": context.s3_dx,
-        "ddx": context.s3_ddx,
-    }
-
-    force_dofs = np.empty(len(terms), dtype=np.int64)
-    coordinate_dofs = np.empty(len(terms), dtype=np.int64)
-    variables: list[str] = []
-    values = np.empty((sample_count, len(terms)), dtype=np.float64)
-
-    for index, term in enumerate(terms):
-        if term.variable not in s3_by_variable:
-            raise ValueError(f"unsupported nonlinear Jacobian variable {term.variable!r}")
-        if not (0 <= term.force_dof < n_dof):
-            raise ValueError(f"force_dof out of range: {term.force_dof}")
-        if not (0 <= term.coordinate_dof < n_dof):
-            raise ValueError(f"coordinate_dof out of range: {term.coordinate_dof}")
-        term_values = np.asarray(term.values, dtype=np.float64).reshape(-1)
-        if term_values.shape[0] != sample_count:
-            raise ValueError(
-                "nonlinear Jacobian term values must have one value per time sample; "
-                f"got {term_values.shape[0]}, expected {sample_count}"
-            )
-        force_dofs[index] = term.force_dof
-        coordinate_dofs[index] = term.coordinate_dof
-        variables.append(term.variable)
-        values[:, index] = term_values
-
-    coeffs = coefficient_matrix_from_fft(
-        values,
+    local_pair_count = force_count * coordinate_count
+    flattened = np.concatenate(
+        tuple(values.reshape(sample_count, local_pair_count) for _, values, _ in active),
+        axis=1,
+    )
+    all_coefficients = coefficient_matrix_from_fft(
+        flattened,
         context.nonlinear_harmonics,
         context.sample_count,
         context.nonlinear_harmonic_indices,
     )
+
+    force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
+    coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
+    force_columns = np.repeat(force_dofs_array, coordinate_count)
+    coordinate_columns = np.tile(coordinate_dofs_array, force_count)
     local_rows = np.tile(np.arange(order, dtype=np.int64), order)
     local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
+    row_indices = force_columns[:, None] * order + local_rows[None, :]
+    col_indices = coordinate_columns[:, None] * order + local_cols[None, :]
     row_chunks: list[NDArray[np.int64]] = []
     col_chunks: list[NDArray[np.int64]] = []
     data_chunks: list[NDArray[np.float64]] = []
 
-    for variable, s3_matrix in s3_by_variable.items():
-        term_indices = np.asarray(
-            [index for index, term_variable in enumerate(variables) if term_variable == variable],
-            dtype=np.int64,
-        )
-        if term_indices.size == 0:
-            continue
-        term_blocks_flat = (s3_matrix @ coeffs[:, term_indices]).T
-        row_indices = force_dofs[term_indices, None] * order + local_rows[None, :]
-        col_indices = coordinate_dofs[term_indices, None] * order + local_cols[None, :]
+    coefficient_offset = 0
+    for _, _, s3_matrix in active:
+        variable_coefficients = all_coefficients[
+            :,
+            coefficient_offset : coefficient_offset + local_pair_count,
+        ]
+        coefficient_offset += local_pair_count
+        term_blocks_flat = (s3_matrix @ variable_coefficients).T
         row_chunks.append(row_indices.reshape(-1))
         col_chunks.append(col_indices.reshape(-1))
         data_chunks.append(term_blocks_flat.reshape(-1))
@@ -254,44 +259,6 @@ def _scatter_local_coefficient_matrix(
     full_coefficients = np.zeros((order, n_dof), dtype=np.float64)
     full_coefficients[:, list(force_dofs)] = coefficients
     return full_coefficients.reshape(-1, order="F")
-
-
-def _local_jacobian_terms_to_global(
-    local_terms: Sequence[object],
-    force_dofs: Sequence[int],
-    coordinate_dofs: Sequence[int],
-    sample_count: int,
-    n_dof: int,
-    label: str,
-) -> tuple[NonlinearJacobianTerm, ...]:
-    force_dofs = _validated_dofs("force_dofs", force_dofs, n_dof)
-    coordinate_dofs = _validated_dofs("coordinate_dofs", coordinate_dofs, n_dof)
-    global_terms: list[NonlinearJacobianTerm] = []
-    for term in local_terms:
-        variable = getattr(term, "variable")
-        if variable not in ("x", "dx", "ddx"):
-            raise ValueError(f"unsupported {label} Jacobian variable {variable!r}")
-        force_index = int(getattr(term, "force_index"))
-        coordinate_index = int(getattr(term, "coordinate_index"))
-        if not (0 <= force_index < len(force_dofs)):
-            raise ValueError(f"{label} force_index out of range: {force_index}")
-        if not (0 <= coordinate_index < len(coordinate_dofs)):
-            raise ValueError(f"{label} coordinate_index out of range: {coordinate_index}")
-        values = np.asarray(getattr(term, "values"), dtype=np.float64).reshape(-1)
-        if values.shape[0] != sample_count:
-            raise ValueError(
-                f"{label} Jacobian term values must have one value per time sample; "
-                f"got {values.shape[0]}, expected {sample_count}"
-            )
-        global_terms.append(
-            NonlinearJacobianTerm(
-                force_dofs[force_index],
-                variable,
-                coordinate_dofs[coordinate_index],
-                values,
-            )
-        )
-    return tuple(global_terms)
 
 
 def _validate_positive_scale(name: str, value: float) -> None:

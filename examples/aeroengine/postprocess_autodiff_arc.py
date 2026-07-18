@@ -16,7 +16,7 @@ from examples.aeroengine.run_autodiff_arc import DEFAULT_PLOT_DOFS, FREQUENCY_RE
 from pyhb import FloquetConfig, compute_floquet_autodiff
 from pyhb.harmonics import generate_hb_items
 
-DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc_190.npz"
+DEFAULT_INPUT = Path(__file__).resolve().parent / "results" / "autodiff_arc_temp.npz"
 DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "results" / "autodiff_arc.png"
 DEFAULT_OUTPUT_RMS = Path(__file__).resolve().parent / "results" / "autodiff_arc_rms.npz"
 DEFAULT_OUTPUT_FLOQUET = Path(__file__).resolve().parent / "results" / "autodiff_arc_floquet.npz"

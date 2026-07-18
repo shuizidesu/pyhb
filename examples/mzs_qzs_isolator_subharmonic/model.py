@@ -6,7 +6,7 @@ from math import sqrt
 import numpy as np
 from numpy.typing import NDArray
 
-from pyhb import ForcingTerm, LinearOperatorTerm, LocalNonlinearJacobianTerm, SecondOrderTimeModel
+from pyhb import ForcingTerm, LinearOperatorTerm, LocalJacobianMatrices, SecondOrderTimeModel
 
 
 @dataclass(frozen=True)
@@ -129,22 +129,22 @@ class MzsQzsModel(SecondOrderTimeModel):
         force = float(parameter) * damping * phase_velocity + restoring
         return force.reshape(-1, 1)
 
-    def local_nonlinear_jacobian_terms(
+    def local_nonlinear_jacobian(
         self,
         t: NDArray[np.float64],
         local_x: NDArray[np.float64],
         local_dx: NDArray[np.float64],
         local_ddx: NDArray[np.float64],
         parameter: float,
-    ) -> tuple[LocalNonlinearJacobianTerm, ...]:
+    ) -> LocalJacobianMatrices:
         x = local_x[:, 0]
         phase_velocity = local_dx[:, 0]
         damping, damping_derivative, _, restoring_derivative = self._nonlinear_components(x)
         d_force_dx = float(parameter) * phase_velocity * damping_derivative + restoring_derivative
         d_force_dphase_velocity = float(parameter) * damping
-        return (
-            LocalNonlinearJacobianTerm(0, "x", 0, d_force_dx),
-            LocalNonlinearJacobianTerm(0, "dx", 0, d_force_dphase_velocity),
+        return LocalJacobianMatrices(
+            x=d_force_dx.reshape(-1, 1, 1),
+            dx=d_force_dphase_velocity.reshape(-1, 1, 1),
         )
 
     def local_nonlinear_parameter_derivative(

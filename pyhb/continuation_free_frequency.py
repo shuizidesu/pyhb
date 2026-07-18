@@ -16,7 +16,6 @@ from .continuation_core import (
     _array_is_finite,
     _coefficient_matrix,
     _evaluate_local_state,
-    _local_jacobian_terms_to_global,
     _local_samples_to_global_coefficients,
     _parameter_step_too_large,
     _PoweredEvaluation,
@@ -29,7 +28,7 @@ from .continuation_core import (
     _validate_optional_positive_scale,
     _validate_positive_scale,
     _validated_dofs,
-    assemble_hb_jacobian_from_terms,
+    assemble_hb_jacobian_from_local_matrices,
 )
 from .harmonics import flatten_coefficients
 from .hb_operators import coefficient_derivative_maps
@@ -232,29 +231,22 @@ class ContinuationFreeFrequencySolver:
             self.model.n_dof,
             "local residual force",
         )
-        local_terms = tuple(
-            self.model.local_residual_jacobian_terms(
-                self.prepared.t,
-                local_x,
-                local_dx,
-                local_ddx,
-                omega,
-                parameter,
-            )
+        local_jacobian = self.model.local_residual_jacobian(
+            self.prepared.t,
+            local_x,
+            local_dx,
+            local_ddx,
+            omega,
+            parameter,
         )
-        global_terms = _local_jacobian_terms_to_global(
-            local_terms,
+        generalized_jacobian = assemble_hb_jacobian_from_local_matrices(
+            local_jacobian,
             force_dofs,
             coordinate_dofs,
-            self.prepared.t.size,
-            self.model.n_dof,
-            "local residual",
-        )
-        generalized_jacobian = assemble_hb_jacobian_from_terms(
-            global_terms,
             self.prepared.context,
             self.prepared.t.size,
             self.model.n_dof,
+            "local residual",
         )
         local_omega = self.model.local_residual_omega_derivative(
             self.prepared.t,
