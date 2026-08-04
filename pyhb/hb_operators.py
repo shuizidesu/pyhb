@@ -7,9 +7,13 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy import sparse
 from scipy.integrate import quad_vec
 
 from .harmonics import generate_hb_items
+
+
+_S3_ZERO_TOLERANCE = 1e-12
 
 
 def _emit_progress(progress_callback: Callable[[str], None] | None, message: str) -> None:
@@ -70,9 +74,9 @@ class HBContext:
     period: float
     sample_count: int
     order: int
-    s3: NDArray[np.float64]
-    s3_dx: NDArray[np.float64]
-    s3_ddx: NDArray[np.float64]
+    s3: sparse.csr_matrix
+    s3_dx: sparse.csr_matrix
+    s3_ddx: sparse.csr_matrix
 
     @classmethod
     def build(
@@ -99,7 +103,7 @@ class HBContext:
             progress_callback,
             f"Precomputing S3... method={s3_method}, harmonics={len(hb)}, nonlinear_harmonics={len(nlhb)}",
         )
-        s3 = compute_s3(
+        s3_dense = compute_s3(
             hb,
             nlhb,
             hb_indices,
@@ -109,10 +113,14 @@ class HBContext:
             method=s3_method,
             quadrature_samples=s3_quadrature_samples,
         )
+        s3_dense[np.abs(s3_dense) < _S3_ZERO_TOLERANCE] = 0.0
         order = 2 * len(hb) + 1
         coefficient_dt_map, coefficient_ddt_map = coefficient_derivative_maps(hb)
-        s3_dx = _differentiate_s3(s3, coefficient_dt_map, order)
-        s3_ddx = _differentiate_s3(s3, coefficient_ddt_map, order)
+        s3_dx_dense = _differentiate_s3(s3_dense, coefficient_dt_map, order)
+        s3_ddx_dense = _differentiate_s3(s3_dense, coefficient_ddt_map, order)
+        s3 = sparse.csr_matrix(s3_dense)
+        s3_dx = sparse.csr_matrix(s3_dx_dense)
+        s3_ddx = sparse.csr_matrix(s3_ddx_dense)
         _emit_progress(
             progress_callback,
             f"Precompute finished. order={order}, period={grid.period:.12g}, s3_shape={s3.shape}",

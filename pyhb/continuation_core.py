@@ -132,7 +132,7 @@ def assemble_hb_jacobian_from_local_matrices(
     force_count = len(force_dofs)
     coordinate_count = len(coordinate_dofs)
     expected_shape = (sample_count, force_count, coordinate_count)
-    active: list[tuple[str, NDArray[np.float64], NDArray[np.float64]]] = []
+    active: list[tuple[str, NDArray[np.float64], sparse.csr_matrix]] = []
     for variable, values, s3_matrix in (
         ("x", jacobians.x, context.s3),
         ("dx", jacobians.dx, context.s3_dx),
@@ -168,9 +168,7 @@ def assemble_hb_jacobian_from_local_matrices(
     local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
     row_indices = force_columns[:, None] * order + local_rows[None, :]
     col_indices = coordinate_columns[:, None] * order + local_cols[None, :]
-    row_chunks: list[NDArray[np.int64]] = []
-    col_chunks: list[NDArray[np.int64]] = []
-    data_chunks: list[NDArray[np.float64]] = []
+    combined_blocks_flat = np.zeros((local_pair_count, order * order), dtype=np.float64)
 
     coefficient_offset = 0
     for _, _, s3_matrix in active:
@@ -179,14 +177,11 @@ def assemble_hb_jacobian_from_local_matrices(
             coefficient_offset : coefficient_offset + local_pair_count,
         ]
         coefficient_offset += local_pair_count
-        term_blocks_flat = (s3_matrix @ variable_coefficients).T
-        row_chunks.append(row_indices.reshape(-1))
-        col_chunks.append(col_indices.reshape(-1))
-        data_chunks.append(term_blocks_flat.reshape(-1))
+        combined_blocks_flat += np.asarray(s3_matrix @ variable_coefficients).T
 
-    rows = np.concatenate(row_chunks)
-    cols = np.concatenate(col_chunks)
-    data = np.concatenate(data_chunks)
+    rows = row_indices.reshape(-1)
+    cols = col_indices.reshape(-1)
+    data = combined_blocks_flat.reshape(-1)
     return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
 
 

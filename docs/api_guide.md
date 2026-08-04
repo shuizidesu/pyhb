@@ -175,8 +175,10 @@ Jacobian terms.
 
 The S3 matrix is the common projection operator for nonlinear Jacobians. It couples
 one residual test basis function, one response basis function, and one nonlinear
-Jacobian Fourier basis function. It is stored as a two-dimensional matrix with
-shape `(order*order, nonlinear_order)`.
+Jacobian Fourier basis function. It is stored as a two-dimensional CSR sparse
+matrix with shape `(order*order, nonlinear_order)`. Values below `1e-12` are
+discarded during preprocessing to remove FFT roundoff from theoretically zero
+entries before the sparse representation is built.
 
 Mathematically this is an `(order, order, nonlinear_order)` tensor. `s3`,
 `s3_dx`, and `s3_ddx` all use the same flattened shape and Fortran ordering.
@@ -197,9 +199,10 @@ After S3 is computed, `HBContext.build(...)` constructs:
 - `s3_ddx`: used for derivatives with respect to `ddx`.
 
 These matrices are precomputed once for the configured harmonic grid. Runtime
-nonlinear Jacobian assembly multiplies the selected S3 matrix by the Fourier
-coefficients of local derivative samples, then scatters the flattened local HB
-blocks into the global sparse Jacobian.
+nonlinear Jacobian assembly multiplies the selected sparse S3 matrix by the dense
+Fourier coefficients of local derivative samples. Contributions associated with
+`x`, `dx`, and `ddx` are summed in local HB blocks before those blocks are
+scattered once into the global sparse Jacobian.
 
 ## Model Interface
 
