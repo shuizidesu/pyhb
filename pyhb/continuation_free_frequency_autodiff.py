@@ -11,14 +11,19 @@ from torch.func import jacfwd, jacrev
 
 from .autodiff_utils import (
     _as_torch,
+    _compact_jacobian_fourier,
     _resolve_torch_device,
     _select_variable,
     _to_numpy,
+    _validate_autodiff_jacobian_mode,
     _validate_autodiff_variables,
+    _validate_rfft_harmonic_indices,
 )
 from .continuation_core import (
+    _CompactJacobianFourier,
     _local_samples_to_global_coefficients,
     _validated_dofs,
+    assemble_hb_jacobian_from_compact_fourier,
     assemble_hb_jacobian_from_local_matrices,
 )
 from .continuation_free_frequency import (
@@ -34,12 +39,14 @@ class ContinuationFreeFrequencyAutodiffConfig(ContinuationFreeFrequencyConfig):
     """Free-frequency continuation config with an optional Torch device selector."""
 
     torch_device: str | None = None
+    autodiff_jacobian_mode: str = "dense"
 
 
 @dataclass(frozen=True)
 class _FreeAutodiffLocalEvaluation:
     force_samples: NDArray[np.float64]
-    jacobian: LocalJacobianMatrices
+    jacobian: LocalJacobianMatrices | None
+    compact_jacobians: tuple[_CompactJacobianFourier, ...]
     omega_derivative: NDArray[np.float64]
     parameter_derivative: NDArray[np.float64]
 
@@ -56,10 +63,18 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
             raise TypeError(
                 "ContinuationFreeFrequencyAutodiffSolver requires an AutodiffFreeFrequencySecondOrderTimeModel"
             )
-        super().__init__(model, config or ContinuationFreeFrequencyAutodiffConfig())
+        active_config = config or ContinuationFreeFrequencyAutodiffConfig()
+        jacobian_mode = _validate_autodiff_jacobian_mode(active_config.autodiff_jacobian_mode)
+        super().__init__(model, active_config)
         self.model: AutodiffFreeFrequencySecondOrderTimeModel
         self.config: ContinuationFreeFrequencyAutodiffConfig
         self._torch_device = _resolve_torch_device(self.config.torch_device)
+        self._autodiff_jacobian_mode = jacobian_mode
+        if jacobian_mode == "sparse":
+            _validate_rfft_harmonic_indices(
+                self.prepared.context.nonlinear_harmonic_indices,
+                self.prepared.context.sample_count,
+            )
         self._autodiff_variables = _validate_autodiff_variables(self.model.autodiff_variables)
         self._t_tensor = _as_torch(self.prepared.t, self._torch_device)
 
@@ -96,15 +111,25 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
             self.model.n_dof,
             "local residual force",
         )
-        generalized_jacobian = assemble_hb_jacobian_from_local_matrices(
-            local.jacobian,
-            force_dofs,
-            coordinate_dofs,
-            self.prepared.context,
-            self.prepared.t.size,
-            self.model.n_dof,
-            "local residual",
-        )
+        if local.jacobian is not None:
+            generalized_jacobian = assemble_hb_jacobian_from_local_matrices(
+                local.jacobian,
+                force_dofs,
+                coordinate_dofs,
+                self.prepared.context,
+                self.prepared.t.size,
+                self.model.n_dof,
+                "local residual",
+            )
+        else:
+            generalized_jacobian = assemble_hb_jacobian_from_compact_fourier(
+                local.compact_jacobians,
+                force_dofs,
+                coordinate_dofs,
+                self.prepared.context,
+                self.model.n_dof,
+                "local residual",
+            )
         omega_coefficients = _local_samples_to_global_coefficients(
             local.omega_derivative,
             force_dofs,
@@ -161,6 +186,8 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
             raise ValueError(f"local residual force must have shape {expected_force_shape}, got {force_samples.shape}")
 
         jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]] = {}
+        compact_jacobians: list[_CompactJacobianFourier] = []
+        expected_jacobian_shape = (self.prepared.t.size, force_count, coordinate_count)
         for variable in self._autodiff_variables:
             jacobian_tensor = self._differentiate_variable(
                 variable,
@@ -171,11 +198,28 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
                 omega_tensor,
                 parameter_tensor,
             )
-            jacobian = _to_numpy(jacobian_tensor)
-            expected_jacobian_shape = (self.prepared.t.size, force_count, coordinate_count)
-            if jacobian.shape != expected_jacobian_shape:
-                raise ValueError(f"dG/d{variable} must have shape {expected_jacobian_shape}, got {jacobian.shape}")
-            jacobian_by_variable[variable] = jacobian
+            if tuple(jacobian_tensor.shape) != expected_jacobian_shape:
+                raise ValueError(
+                    f"dG/d{variable} must have shape {expected_jacobian_shape}, "
+                    f"got {tuple(jacobian_tensor.shape)}"
+                )
+            if self._autodiff_jacobian_mode == "dense":
+                jacobian_by_variable[variable] = _to_numpy(jacobian_tensor)
+            else:
+                force_indices, coordinate_indices, coefficients = _compact_jacobian_fourier(
+                    jacobian_tensor,
+                    self.prepared.context.nonlinear_harmonic_indices,
+                    self.prepared.context.sample_count,
+                )
+                compact_jacobians.append(
+                    _CompactJacobianFourier(
+                        variable=variable,
+                        force_indices=force_indices,
+                        coordinate_indices=coordinate_indices,
+                        coefficients=coefficients,
+                    )
+                )
+            del jacobian_tensor
 
         if self.model.autodiff_omega_dependent:
             omega_derivative = _to_numpy(
@@ -199,12 +243,20 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
                 "local residual parameter derivative must have shape "
                 f"{expected_force_shape}, got {parameter_derivative.shape}"
             )
-        jacobian = LocalJacobianMatrices(
-            x=jacobian_by_variable.get("x"),
-            dx=jacobian_by_variable.get("dx"),
-            ddx=jacobian_by_variable.get("ddx"),
+        jacobian = None
+        if self._autodiff_jacobian_mode == "dense":
+            jacobian = LocalJacobianMatrices(
+                x=jacobian_by_variable.get("x"),
+                dx=jacobian_by_variable.get("dx"),
+                ddx=jacobian_by_variable.get("ddx"),
+            )
+        return _FreeAutodiffLocalEvaluation(
+            force_samples,
+            jacobian,
+            tuple(compact_jacobians),
+            omega_derivative,
+            parameter_derivative,
         )
-        return _FreeAutodiffLocalEvaluation(force_samples, jacobian, omega_derivative, parameter_derivative)
 
     def _call_torch_force(
         self,

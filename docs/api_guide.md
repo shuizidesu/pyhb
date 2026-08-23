@@ -386,6 +386,7 @@ from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver
 config = ContinuationAutodiffConfig(
     harmonics=(1.0, 2.0, 3.0),
     torch_device=None,
+    autodiff_jacobian_mode="dense",
 )
 
 result = ContinuationAutodiffSolver(model, config).run(initial_coefficients)
@@ -395,6 +396,19 @@ result = ContinuationAutodiffSolver(model, config).run(initial_coefficients)
 
 - `torch_device`: optional Torch device selector such as `"cpu"` or `"cuda"`.
   `None` uses CUDA when available, otherwise CPU.
+- `autodiff_jacobian_mode`: `"dense"` preserves the standard batched Jacobian
+  path. `"sparse"` detects strictly active local force-coordinate pairs after
+  each dense `jacrev`, performs their batched `rfft` on the Torch device, and
+  transfers only compact Fourier coefficients for S3 contraction and sparse
+  global assembly.
+
+The sparse mode is useful when nonlinear forces are distributed over many DOFs
+but each force depends on only a few coordinates. It does not remove the peak
+memory required by the dense `jacrev` result itself; it reduces subsequent
+device transfer, FFT, S3 contraction, and COO/CSC assembly from all spatial
+pairs to only strictly nonzero pairs. No numerical threshold is applied. The
+configured `sample_fft` must place every internally generated nonlinear
+harmonic index within the rFFT Nyquist range.
 
 The continuation loop, residual definition, linear assembly, S3 operators, and
 result object match the full analytical solver. Only the nonlinear derivative
@@ -458,7 +472,9 @@ the previous accepted reference solution.
 `AutodiffFreeFrequencySecondOrderTimeModel`. The model supplies
 `local_residual_force_torch(...)`, and Torch autodiff builds the local
 derivatives controlled by `autodiff_variables`, `autodiff_omega_dependent`, and
-`autodiff_parameter_dependent`.
+`autodiff_parameter_dependent`. Its config supports the same
+`autodiff_jacobian_mode="dense"|"sparse"` projection choice as forced-response
+autodiff continuation.
 
 ## Floquet Stability
 

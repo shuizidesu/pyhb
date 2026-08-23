@@ -111,6 +111,14 @@ class _BorderedArcSolve:
     tangent_candidate: NDArray[np.float64]
 
 
+@dataclass(frozen=True)
+class _CompactJacobianFourier:
+    variable: str
+    force_indices: NDArray[np.int64]
+    coordinate_indices: NDArray[np.int64]
+    coefficients: NDArray[np.float64]
+
+
 def assemble_hb_jacobian_from_local_matrices(
     jacobians: LocalJacobianMatrices,
     force_dofs: Sequence[int],
@@ -182,6 +190,80 @@ def assemble_hb_jacobian_from_local_matrices(
     rows = row_indices.reshape(-1)
     cols = col_indices.reshape(-1)
     data = combined_blocks_flat.reshape(-1)
+    return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
+
+
+def assemble_hb_jacobian_from_compact_fourier(
+    contributions: Sequence[_CompactJacobianFourier],
+    force_dofs: Sequence[int],
+    coordinate_dofs: Sequence[int],
+    context: HBContext,
+    n_dof: int,
+    label: str,
+) -> sparse.csc_matrix:
+    """Contract compact spatial edges and scatter one sparse HB Jacobian."""
+
+    order = context.order
+    size = n_dof * order
+    force_dofs = _validated_dofs("force_dofs", force_dofs, n_dof)
+    coordinate_dofs = _validated_dofs("coordinate_dofs", coordinate_dofs, n_dof)
+    force_count = len(force_dofs)
+    coordinate_count = len(coordinate_dofs)
+    nonlinear_order = context.s3.shape[1]
+    s3_by_variable = {
+        "x": context.s3,
+        "dx": context.s3_dx,
+        "ddx": context.s3_ddx,
+    }
+
+    edge_keys: list[NDArray[np.int64]] = []
+    hb_blocks: list[NDArray[np.float64]] = []
+    for contribution in contributions:
+        if contribution.variable not in s3_by_variable:
+            raise ValueError(f"unsupported compact Jacobian variable {contribution.variable!r}")
+        force_indices = np.asarray(contribution.force_indices, dtype=np.int64).reshape(-1)
+        coordinate_indices = np.asarray(contribution.coordinate_indices, dtype=np.int64).reshape(-1)
+        coefficients = np.asarray(contribution.coefficients, dtype=np.float64)
+        edge_count = force_indices.size
+        if coordinate_indices.size != edge_count:
+            raise ValueError(f"{label} compact force and coordinate indices must have equal lengths")
+        expected_shape = (nonlinear_order, edge_count)
+        if coefficients.shape != expected_shape:
+            raise ValueError(
+                f"{label} compact Fourier coefficients must have shape {expected_shape}, "
+                f"got {coefficients.shape}"
+            )
+        if np.any(force_indices < 0) or np.any(force_indices >= force_count):
+            raise ValueError(f"{label} compact force indices are out of range")
+        if np.any(coordinate_indices < 0) or np.any(coordinate_indices >= coordinate_count):
+            raise ValueError(f"{label} compact coordinate indices are out of range")
+        if edge_count == 0:
+            continue
+        edge_keys.append(force_indices * coordinate_count + coordinate_indices)
+        hb_blocks.append(np.asarray(s3_by_variable[contribution.variable] @ coefficients).T)
+
+    if not edge_keys or force_count == 0 or coordinate_count == 0:
+        return sparse.csc_matrix((size, size), dtype=np.float64)
+
+    keys = np.concatenate(edge_keys)
+    blocks = np.concatenate(hb_blocks, axis=0)
+    permutation = np.argsort(keys, kind="stable")
+    sorted_keys = keys[permutation]
+    sorted_blocks = blocks[permutation]
+    unique_keys, first_indices = np.unique(sorted_keys, return_index=True)
+    combined_blocks = np.add.reduceat(sorted_blocks, first_indices, axis=0)
+
+    local_force_indices = unique_keys // coordinate_count
+    local_coordinate_indices = unique_keys % coordinate_count
+    force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
+    coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
+    global_force_dofs = force_dofs_array[local_force_indices]
+    global_coordinate_dofs = coordinate_dofs_array[local_coordinate_indices]
+    local_rows = np.tile(np.arange(order, dtype=np.int64), order)
+    local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
+    rows = (global_force_dofs[:, None] * order + local_rows[None, :]).reshape(-1)
+    cols = (global_coordinate_dofs[:, None] * order + local_cols[None, :]).reshape(-1)
+    data = combined_blocks.reshape(-1)
     return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
 
 

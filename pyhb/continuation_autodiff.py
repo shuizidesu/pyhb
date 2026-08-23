@@ -11,15 +11,20 @@ from torch.func import jacfwd, jacrev
 
 from .autodiff_utils import (
     _as_torch,
+    _compact_jacobian_fourier,
     _resolve_torch_device,
     _select_variable,
     _to_numpy,
+    _validate_autodiff_jacobian_mode,
     _validate_autodiff_variables,
+    _validate_rfft_harmonic_indices,
 )
 from .continuation import ContinuationConfig, ContinuationSolver, _NonlinearEvaluation
 from .continuation_core import (
+    _CompactJacobianFourier,
     _local_samples_to_global_coefficients,
     _validated_dofs,
+    assemble_hb_jacobian_from_compact_fourier,
     assemble_hb_jacobian_from_local_matrices,
 )
 from .models import AutodiffSecondOrderTimeModel, JacobianVariable, LocalJacobianMatrices
@@ -30,12 +35,14 @@ class ContinuationAutodiffConfig(ContinuationConfig):
     """Continuation config with an optional Torch device selector."""
 
     torch_device: str | None = None
+    autodiff_jacobian_mode: str = "dense"
 
 
 @dataclass(frozen=True)
 class _AutodiffLocalEvaluation:
     force_samples: NDArray[np.float64]
-    jacobian: LocalJacobianMatrices
+    jacobian: LocalJacobianMatrices | None
+    compact_jacobians: tuple[_CompactJacobianFourier, ...]
     parameter_derivative: NDArray[np.float64]
 
 
@@ -49,10 +56,18 @@ class ContinuationAutodiffSolver(ContinuationSolver):
     ) -> None:
         if not isinstance(model, AutodiffSecondOrderTimeModel):
             raise TypeError("ContinuationAutodiffSolver requires an AutodiffSecondOrderTimeModel")
-        super().__init__(model, config or ContinuationAutodiffConfig())
+        active_config = config or ContinuationAutodiffConfig()
+        jacobian_mode = _validate_autodiff_jacobian_mode(active_config.autodiff_jacobian_mode)
+        super().__init__(model, active_config)
         self.model: AutodiffSecondOrderTimeModel
         self.config: ContinuationAutodiffConfig
         self._torch_device = _resolve_torch_device(self.config.torch_device)
+        self._autodiff_jacobian_mode = jacobian_mode
+        if jacobian_mode == "sparse":
+            _validate_rfft_harmonic_indices(
+                self.prepared.context.nonlinear_harmonic_indices,
+                self.prepared.context.sample_count,
+            )
         self._autodiff_variables = _validate_autodiff_variables(self.model.autodiff_variables)
         self._t_tensor = _as_torch(self.prepared.t, self._torch_device)
 
@@ -87,15 +102,25 @@ class ContinuationAutodiffSolver(ContinuationSolver):
             self.model.n_dof,
             "local nonlinear force",
         )
-        nonlinear_jacobian = assemble_hb_jacobian_from_local_matrices(
-            local.jacobian,
-            force_dofs,
-            coordinate_dofs,
-            self.prepared.context,
-            self.prepared.t.size,
-            self.model.n_dof,
-            "local nonlinear",
-        )
+        if local.jacobian is not None:
+            nonlinear_jacobian = assemble_hb_jacobian_from_local_matrices(
+                local.jacobian,
+                force_dofs,
+                coordinate_dofs,
+                self.prepared.context,
+                self.prepared.t.size,
+                self.model.n_dof,
+                "local nonlinear",
+            )
+        else:
+            nonlinear_jacobian = assemble_hb_jacobian_from_compact_fourier(
+                local.compact_jacobians,
+                force_dofs,
+                coordinate_dofs,
+                self.prepared.context,
+                self.model.n_dof,
+                "local nonlinear",
+            )
         parameter_coefficients = None
         if include_parameter:
             parameter_coefficients = _local_samples_to_global_coefficients(
@@ -137,6 +162,8 @@ class ContinuationAutodiffSolver(ContinuationSolver):
             raise ValueError(f"local nonlinear force must have shape {expected_force_shape}, got {force_samples.shape}")
 
         jacobian_by_variable: dict[JacobianVariable, NDArray[np.float64]] = {}
+        compact_jacobians: list[_CompactJacobianFourier] = []
+        expected_jacobian_shape = (self.prepared.t.size, force_count, coordinate_count)
         for variable in self._autodiff_variables:
             jacobian_tensor = self._differentiate_variable(
                 variable,
@@ -146,11 +173,28 @@ class ContinuationAutodiffSolver(ContinuationSolver):
                 ddx_tensor,
                 parameter_tensor,
             )
-            jacobian = _to_numpy(jacobian_tensor)
-            expected_jacobian_shape = (self.prepared.t.size, force_count, coordinate_count)
-            if jacobian.shape != expected_jacobian_shape:
-                raise ValueError(f"dN/d{variable} must have shape {expected_jacobian_shape}, got {jacobian.shape}")
-            jacobian_by_variable[variable] = jacobian
+            if tuple(jacobian_tensor.shape) != expected_jacobian_shape:
+                raise ValueError(
+                    f"dN/d{variable} must have shape {expected_jacobian_shape}, "
+                    f"got {tuple(jacobian_tensor.shape)}"
+                )
+            if self._autodiff_jacobian_mode == "dense":
+                jacobian_by_variable[variable] = _to_numpy(jacobian_tensor)
+            else:
+                force_indices, coordinate_indices, coefficients = _compact_jacobian_fourier(
+                    jacobian_tensor,
+                    self.prepared.context.nonlinear_harmonic_indices,
+                    self.prepared.context.sample_count,
+                )
+                compact_jacobians.append(
+                    _CompactJacobianFourier(
+                        variable=variable,
+                        force_indices=force_indices,
+                        coordinate_indices=coordinate_indices,
+                        coefficients=coefficients,
+                    )
+                )
+            del jacobian_tensor
 
         if include_parameter and self.model.autodiff_parameter_dependent:
             parameter_derivative = _to_numpy(
@@ -163,12 +207,19 @@ class ContinuationAutodiffSolver(ContinuationSolver):
                 "local nonlinear parameter derivative must have shape "
                 f"{expected_force_shape}, got {parameter_derivative.shape}"
             )
-        jacobian = LocalJacobianMatrices(
-            x=jacobian_by_variable.get("x"),
-            dx=jacobian_by_variable.get("dx"),
-            ddx=jacobian_by_variable.get("ddx"),
+        jacobian = None
+        if self._autodiff_jacobian_mode == "dense":
+            jacobian = LocalJacobianMatrices(
+                x=jacobian_by_variable.get("x"),
+                dx=jacobian_by_variable.get("dx"),
+                ddx=jacobian_by_variable.get("ddx"),
+            )
+        return _AutodiffLocalEvaluation(
+            force_samples,
+            jacobian,
+            tuple(compact_jacobians),
+            parameter_derivative,
         )
-        return _AutodiffLocalEvaluation(force_samples, jacobian, parameter_derivative)
 
     def _call_torch_force(
         self,

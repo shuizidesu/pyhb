@@ -30,10 +30,10 @@ DEFAULT_HB_INPUT = Path(__file__).resolve().parent / "autodiff_arc.npz"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run an MZS-QZS ODE frequency sweep and compute steady RMS response.")
-    parser.add_argument("--omega-start", type=float, default=0.01)
-    parser.add_argument("--omega-end", type=float, default=0.8)
-    parser.add_argument("--omega-step", type=float, default=0.01)
-    parser.add_argument("--settle-periods", type=int, default=80)
+    parser.add_argument("--omega-start", type=float, default=1.0)
+    parser.add_argument("--omega-end", type=float, default=0.01)
+    parser.add_argument("--omega-step", type=float, default=-0.01)
+    parser.add_argument("--settle-periods", type=int, default=50)
     parser.add_argument("--rms-periods", type=int, default=10)
     parser.add_argument("--history-periods", type=int, default=1)
     parser.add_argument("--points-per-period", type=int, default=512)

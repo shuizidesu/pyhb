@@ -25,8 +25,9 @@ from examples.mzs_qzs_isolator_subharmonic.run_autodiff_arc import (
 
 DEFAULT_INPUT = Path(__file__).resolve().parent / "autodiff_arc.npz"
 DEFAULT_OUTPUT_FIG = Path(__file__).resolve().parent / "time_history_compare.png"
+DEFAULT_OUTPUT_DATA = Path(__file__).resolve().parent / "time_history_compare.npz"
 DEFAULT_POINTS_PER_PERIOD = 2048
-DEFAULT_PERIODS = 3
+DEFAULT_PERIODS = 100
 INTEGRATION_METHODS = ("DOP853", "RK45", "Radau", "BDF")
 
 
@@ -35,12 +36,12 @@ def parse_args() -> argparse.Namespace:
         description="Compare MZS-QZS subharmonic HB and ODE time histories at one continuation point."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--index", type=int, default=0)
+    parser.add_argument("--index", type=int, default=15)
     parser.add_argument("--periods", type=int, default=DEFAULT_PERIODS)
     parser.add_argument("--points-per-period", type=int, default=DEFAULT_POINTS_PER_PERIOD)
     parser.add_argument("--dofs", type=int, nargs="+", default=DEFAULT_PLOT_DOFS)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_FIG)
-    parser.add_argument("--data-output", type=Path, default=None)
+    parser.add_argument("--data-output", type=Path, default=DEFAULT_OUTPUT_DATA)
     parser.add_argument("--method", choices=INTEGRATION_METHODS, default="DOP853")
     parser.add_argument("--rtol", type=float, default=1e-8)
     parser.add_argument("--atol", type=float, default=1e-10)
