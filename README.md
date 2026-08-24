@@ -68,8 +68,37 @@ result = ContinuationSolver(model, config).run(initial_coefficients=initial_coef
 print(result.parameter_history)
 ```
 
-For Torch-based nonlinear derivatives, install the `autodiff` extra and use `ContinuationAutodiffSolver`
-or `ContinuationFreeFrequencyAutodiffSolver`.
+The Newton backend is selected in the solver config:
+
+```python
+# Analytical Jacobian model
+config = ContinuationConfig(linear_solver="sparse")  # or "dense"
+
+# Torch autodiff model
+from pyhb import ContinuationAutodiffConfig
+
+config = ContinuationAutodiffConfig(
+    linear_solver="sparse",
+    autodiff_jacobian_mode="dense",
+)
+```
+
+`linear_solver` controls the final Newton system: `"sparse"` uses CSC matrices
+and SuperLU, while `"dense"` keeps the structured linear operators sparse but
+assembles the complete Newton Jacobian as a dense matrix and uses LAPACK LU.
+`autodiff_jacobian_mode` controls only the nonlinear Jacobian projection after
+Torch AD. The default combination is `linear_solver="sparse"` with
+`autodiff_jacobian_mode="dense"`.
+
+| Linear solver | Autodiff Jacobian | Intended use |
+| --- | --- | --- |
+| `sparse` | `dense` | Default; local nonlinearities and ordinary small-to-large sparse HB systems. |
+| `sparse` | `sparse` | Many nonlinear-force DOFs with diagonal, banded, or otherwise sparse coordinate dependence. |
+| `dense` | `dense` | Moderate HB dimension with a globally dense nonlinear and final Newton Jacobian. |
+| `dense` | `sparse` | Unsupported: compact sparse AD projection would be expanded back to dense and lose its benefit. |
+
+For Torch-based nonlinear derivatives, install the `autodiff` extra and use
+`ContinuationAutodiffSolver` or `ContinuationFreeFrequencyAutodiffSolver`.
 
 ## Examples
 
@@ -81,3 +110,11 @@ python -m examples.machine_absorber.postprocess_arc
 ```
 
 Example model files define system-specific data and nonlinear laws. Solver settings, output paths, and plotting choices belong in run or postprocess scripts.
+
+## Citation
+
+If pyHB is useful in your research, please cite:
+
+Yuhong Jin, Qi Liu, Lei Hou, et al. *pyHB: an open-source
+automatic-differentiation-enhanced semi-analytical solver for nonlinear
+dynamics*, 2026, [**arXiv:2607.17577**](https://arxiv.org/abs/2607.17577).

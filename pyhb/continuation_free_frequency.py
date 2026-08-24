@@ -8,23 +8,26 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 from scipy import sparse
-from scipy.sparse.linalg import splu
 
 from .continuation import ContinuationConfig, _validate_continuation_config
 from .continuation_core import (
     _ArcLengthMetric,
     _array_is_finite,
     _coefficient_matrix,
+    _combine_linear_and_nonlinear_jacobians,
     _evaluate_local_state,
+    _factorize_linear_system,
+    _HBJacobian,
     _local_samples_to_global_coefficients,
+    _matrix_is_finite,
     _parameter_step_too_large,
     _PoweredEvaluation,
     _prepare_continuation_problem,
     _residual_stats,
     _ResidualStats,
     _shrink_arc_length_for_parameter_step,
-    _solve_sparse,
-    _sparse_is_finite,
+    _solve_linear_system,
+    _validate_linear_solver,
     _validate_optional_positive_scale,
     _validate_positive_scale,
     _validated_dofs,
@@ -91,7 +94,7 @@ class ContinuationFreeFrequencyResult:
 @dataclass(frozen=True)
 class _GeneralizedEvaluation:
     coefficients: NDArray[np.float64]
-    jacobian: sparse.csc_matrix
+    jacobian: _HBJacobian
     omega_coefficients: NDArray[np.float64]
     parameter_coefficients: NDArray[np.float64] | None = None
 
@@ -99,7 +102,7 @@ class _GeneralizedEvaluation:
 def _generalized_evaluation_is_finite(generalized: _GeneralizedEvaluation) -> bool:
     return (
         _array_is_finite(generalized.coefficients)
-        and _sparse_is_finite(generalized.jacobian)
+        and _matrix_is_finite(generalized.jacobian)
         and _array_is_finite(generalized.omega_coefficients)
         and (generalized.parameter_coefficients is None or _array_is_finite(generalized.parameter_coefficients))
     )
@@ -118,6 +121,7 @@ class ContinuationFreeFrequencySolver:
         self.model = model
         self.config = config or ContinuationFreeFrequencyConfig()
         _validate_continuation_config(self.config)
+        self._linear_solver = _validate_linear_solver(self.config.linear_solver)
         _validate_positive_scale("parameter_scale", self.config.parameter_scale)
         _validate_positive_scale("constraint_tolerance", self.config.constraint_tolerance)
         _validate_optional_positive_scale("max_parameter_step", self.config.max_parameter_step)
@@ -190,9 +194,13 @@ class ContinuationFreeFrequencySolver:
         omega: float,
         parameter: float,
         powered: _PoweredEvaluation | None = None,
-    ) -> sparse.csc_matrix:
+    ) -> _HBJacobian:
         active_powered = powered or self.prepared.evaluate_powered(omega, derivative=False)
-        return active_powered.operator + generalized.jacobian
+        return _combine_linear_and_nonlinear_jacobians(
+            active_powered.operator,
+            generalized.jacobian,
+            self._linear_solver,
+        )
 
     def _evaluate_generalized(
         self,
@@ -247,6 +255,7 @@ class ContinuationFreeFrequencySolver:
             self.prepared.t.size,
             self.model.n_dof,
             "local residual",
+            self._linear_solver,
         )
         local_omega = self.model.local_residual_omega_derivative(
             self.prepared.t,
@@ -322,7 +331,15 @@ class ContinuationFreeFrequencySolver:
     ) -> float:
         return float(coeff_line[constraint_index] - constraint.value)
 
-    def _fixed_constraint_row(self, width: int, constraint_index: int) -> sparse.csr_matrix:
+    def _fixed_constraint_row(
+        self,
+        width: int,
+        constraint_index: int,
+    ) -> sparse.csr_matrix | NDArray[np.float64]:
+        if self._linear_solver == "dense":
+            row = np.zeros((1, width), dtype=np.float64)
+            row[0, constraint_index] = 1.0
+            return row
         return sparse.csr_matrix(
             (
                 np.array([1.0], dtype=np.float64),
@@ -363,19 +380,31 @@ class ContinuationFreeFrequencySolver:
             )
         return float(self._phase_constraint_row_vector(phase_reference) @ coeff_line)
 
-    def _phase_constraint_row(self, width: int, phase_reference: NDArray[np.float64]) -> sparse.csr_matrix:
+    def _phase_constraint_row(
+        self,
+        width: int,
+        phase_reference: NDArray[np.float64],
+    ) -> sparse.csr_matrix | NDArray[np.float64]:
         row = self._phase_constraint_row_vector(phase_reference)
         if row.size != width:
             raise ValueError(f"phase reference width mismatch: expected {width}, got {row.size}")
+        if self._linear_solver == "dense":
+            return row.reshape(1, width)
         return sparse.csr_matrix(row.reshape(1, width))
 
     def _initial_matrix(
         self,
-        jacobian: sparse.spmatrix,
+        jacobian: _HBJacobian,
         omega_column: NDArray[np.float64],
-        constraint_row: sparse.spmatrix,
-    ) -> sparse.csc_matrix:
+        constraint_row: sparse.spmatrix | NDArray[np.float64],
+    ) -> _HBJacobian:
         size = jacobian.shape[0]
+        if self._linear_solver == "dense":
+            matrix = np.zeros((size + 1, size + 1), dtype=np.float64, order="F")
+            matrix[:size, :size] = np.asarray(jacobian, dtype=np.float64)
+            matrix[:size, size] = -np.asarray(omega_column, dtype=np.float64).reshape(size)
+            matrix[size, :size] = np.asarray(constraint_row, dtype=np.float64).reshape(size)
+            return matrix
         top = sparse.hstack(
             (
                 jacobian,
@@ -388,13 +417,21 @@ class ContinuationFreeFrequencySolver:
 
     def _arc_matrix(
         self,
-        jacobian: sparse.spmatrix,
+        jacobian: _HBJacobian,
         omega_column: NDArray[np.float64],
         parameter_column: NDArray[np.float64],
-        constraint_row: sparse.spmatrix,
+        constraint_row: sparse.spmatrix | NDArray[np.float64],
         arc_row: NDArray[np.float64],
-    ) -> sparse.csc_matrix:
+    ) -> _HBJacobian:
         size = jacobian.shape[0]
+        if self._linear_solver == "dense":
+            matrix = np.zeros((size + 2, size + 2), dtype=np.float64, order="F")
+            matrix[:size, :size] = -np.asarray(jacobian, dtype=np.float64)
+            matrix[:size, size] = np.asarray(omega_column, dtype=np.float64).reshape(size)
+            matrix[:size, size + 1] = np.asarray(parameter_column, dtype=np.float64).reshape(size)
+            matrix[size, :size] = np.asarray(constraint_row, dtype=np.float64).reshape(size)
+            matrix[size + 1, :] = np.asarray(arc_row, dtype=np.float64).reshape(size + 2)
+            return matrix
         top = sparse.hstack(
             (
                 -jacobian,
@@ -417,7 +454,7 @@ class ContinuationFreeFrequencySolver:
         float,
         NDArray[np.float64],
         _GeneralizedEvaluation,
-        sparse.csc_matrix,
+        _HBJacobian,
         _PoweredEvaluation,
         ContinuationFreeFrequencyStepLog,
     ]:
@@ -455,7 +492,7 @@ class ContinuationFreeFrequencySolver:
             initial_constraint_row = self._fixed_constraint_row(jacobian.shape[0], self._initial_constraint_index)
             initial_matrix = self._initial_matrix(jacobian, omega_column, initial_constraint_row)
             rhs = np.concatenate((residual_vector, np.array([-constraint_residual], dtype=np.float64)))
-            delta = _solve_sparse(initial_matrix, rhs)
+            delta = _solve_linear_system(initial_matrix, rhs, self._linear_solver)
             coeff_line = coeff_line + delta[:-1]
             omega = float(omega + delta[-1])
             epoch += 1
@@ -507,7 +544,7 @@ class ContinuationFreeFrequencySolver:
         generalized: _GeneralizedEvaluation,
         omega: float,
         parameter: float,
-        jacobian: sparse.csc_matrix,
+        jacobian: _HBJacobian,
         powered: _PoweredEvaluation,
     ) -> NDArray[np.float64]:
         omega_column = self._omega_column(coeff_line, generalized, omega, parameter, powered)
@@ -515,7 +552,7 @@ class ContinuationFreeFrequencySolver:
         phase_row = self._phase_constraint_row(jacobian.shape[0], coeff_line)
         tangent_matrix = self._initial_matrix(jacobian, omega_column, phase_row)
         rhs = np.concatenate((parameter_column, np.array([0.0], dtype=np.float64)))
-        tangent_q_omega = _solve_sparse(tangent_matrix, rhs)
+        tangent_q_omega = _solve_linear_system(tangent_matrix, rhs, self._linear_solver)
         return self._orient_initial_tangent(np.concatenate((tangent_q_omega, np.array([1.0], dtype=np.float64))))
 
     def run(
@@ -603,7 +640,7 @@ class ContinuationFreeFrequencySolver:
                         break
                     powered = self.prepared.evaluate_powered(omega, derivative=True)
                     jacobian = self._jacobian(generalized, omega, parameter, powered)
-                    if not _sparse_is_finite(jacobian):
+                    if not _matrix_is_finite(jacobian):
                         nonfinite_trial = True
                         break
                     residual_terms = self._residual_terms(coeff_line, generalized, omega, parameter, powered)
@@ -645,10 +682,10 @@ class ContinuationFreeFrequencySolver:
                         phase_row,
                         self._arc_metric.constraint_row(tangent),
                     )
-                    if not _sparse_is_finite(j_arc_v):
+                    if not _matrix_is_finite(j_arc_v):
                         nonfinite_trial = True
                         break
-                    j_arc_lu = splu(j_arc_v)
+                    j_arc_lu = _factorize_linear_system(j_arc_v, self._linear_solver)
                     delta = j_arc_lu.solve(r_arc)
                     if not _array_is_finite(delta):
                         nonfinite_trial = True
@@ -714,9 +751,10 @@ class ContinuationFreeFrequencySolver:
                         next_phase_row,
                         self._arc_metric.constraint_row(tangent),
                     )
-                    tangent_candidate = _solve_sparse(
+                    tangent_candidate = _solve_linear_system(
                         tangent_matrix,
                         np.concatenate((np.zeros(jacobian.shape[0] + 1), np.array([1.0], dtype=np.float64))),
+                        self._linear_solver,
                     )
                     tangent = self._arc_metric.normalize(tangent_candidate)
                     coeff = _coefficient_matrix(coeff_line, self.prepared.context.order, self.model.n_dof)

@@ -65,6 +65,10 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
             )
         active_config = config or ContinuationFreeFrequencyAutodiffConfig()
         jacobian_mode = _validate_autodiff_jacobian_mode(active_config.autodiff_jacobian_mode)
+        if active_config.linear_solver == "dense" and jacobian_mode == "sparse":
+            raise ValueError(
+                "linear_solver='dense' requires autodiff_jacobian_mode='dense'"
+            )
         super().__init__(model, active_config)
         self.model: AutodiffFreeFrequencySecondOrderTimeModel
         self.config: ContinuationFreeFrequencyAutodiffConfig
@@ -120,6 +124,7 @@ class ContinuationFreeFrequencyAutodiffSolver(ContinuationFreeFrequencySolver):
                 self.prepared.t.size,
                 self.model.n_dof,
                 "local residual",
+                self._linear_solver,
             )
         else:
             generalized_jacobian = assemble_hb_jacobian_from_compact_fourier(

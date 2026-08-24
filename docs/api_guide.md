@@ -350,6 +350,9 @@ result = solver.run(initial_coefficients=initial)
   parameter-step guard.
 - `max_steps`, `shrink_limit`, `residual_floor`: continuation and diagnostic
   controls.
+- `linear_solver`: `"sparse"` keeps the default CSC/SuperLU Newton path;
+  `"dense"` assembles the nonlinear HB Jacobian directly as a dense matrix and
+  uses LAPACK LU for systems whose nonlinear Jacobian is globally dense.
 - `progress_callback`: optional callback receiving progress strings. Library
   code is silent when this is `None`.
 
@@ -375,6 +378,28 @@ The full solver assembles:
 - a parameter column from forcing, nonlinear parameter derivative, and linear
   parameter derivative terms.
 
+Both linear-solver modes retain the structured linear HB operators as CSC
+matrices. In dense mode, the S3 contraction produces a dense nonlinear HB
+Jacobian, the sparse linear entries are accumulated into that dense matrix,
+and `scipy.linalg.lu_factor` / `lu_solve` solve the Newton systems. This mode is
+intended only for moderate-size systems whose nonlinear Jacobian makes the
+complete Newton matrix dense. Its matrix storage alone requires approximately
+`8 * (n_dof * order)**2` bytes. Existing local-nonlinearity examples should
+keep the default sparse solver.
+
+For an analytical model, only `linear_solver` needs to be selected:
+
+```python
+from pyhb import ContinuationConfig, ContinuationSolver
+
+config = ContinuationConfig(
+    linear_solver="sparse",  # "sparse" or "dense"
+)
+result = ContinuationSolver(model, config).run(initial_coefficients)
+```
+
+The same field is inherited by `ContinuationFreeFrequencyConfig`.
+
 ## Torch Autodiff Continuation
 
 Use `ContinuationAutodiffSolver` when the nonlinear force is easier to define
@@ -386,6 +411,7 @@ from pyhb import ContinuationAutodiffConfig, ContinuationAutodiffSolver
 config = ContinuationAutodiffConfig(
     harmonics=(1.0, 2.0, 3.0),
     torch_device=None,
+    linear_solver="sparse",
     autodiff_jacobian_mode="dense",
 )
 
@@ -409,6 +435,42 @@ device transfer, FFT, S3 contraction, and COO/CSC assembly from all spatial
 pairs to only strictly nonzero pairs. No numerical threshold is applied. The
 configured `sample_fft` must place every internally generated nonlinear
 harmonic index within the rFFT Nyquist range.
+
+The two options control different stages:
+
+- `autodiff_jacobian_mode` controls processing after Torch has evaluated the
+  local time-sampled Jacobian. It does not select the Newton linear solver.
+- `linear_solver` controls the representation and factorization of the final
+  Newton Jacobian after the linear and nonlinear HB contributions are combined.
+
+Their four possible combinations have the following status and intended use:
+
+| `linear_solver` | `autodiff_jacobian_mode` | Status and intended use |
+| --- | --- | --- |
+| `"sparse"` | `"dense"` | **Supported and default.** The local AD Jacobian, FFT coefficients, and S3 contraction use dense arrays; the resulting HB blocks are scattered to CSC and combined with the sparse linear operator. Use this for localized nonlinearities and the existing pyHB examples. |
+| `"sparse"` | `"sparse"` | **Supported.** After dense `jacrev`, pyHB retains only strictly active force-coordinate pairs, performs compact rFFT/S3 projection, and assembles CSC directly. Use this when nonlinear forces cover many DOFs but their coordinate dependence is diagonal, banded, or otherwise sparse. |
+| `"dense"` | `"dense"` | **Supported.** The nonlinear HB Jacobian is assembled directly as a dense matrix, sparse linear entries are added to it, and LAPACK LU solves the final system. Use this only when the complete Newton Jacobian is genuinely dense and `n_dof * order` is moderate. |
+| `"dense"` | `"sparse"` | **Unsupported.** Compact sparse AD projection is intended to produce a sparse final Jacobian. Expanding it into a dense Newton matrix would add sparse assembly and conversion cost without retaining its memory advantage. |
+
+Accordingly, `linear_solver="dense"` requires
+`autodiff_jacobian_mode="dense"`; the solver raises `ValueError` for the fourth
+combination. The dense mode also requires approximately
+`8 * (n_dof * order)**2` bytes for each full float64 matrix, in addition to LU
+storage and temporary arrays. It should not be selected merely because the
+physical system has many DOFs.
+
+The same two fields and combination rules apply to
+`ContinuationFreeFrequencyAutodiffConfig`:
+
+```python
+from pyhb import ContinuationFreeFrequencyAutodiffConfig
+
+config = ContinuationFreeFrequencyAutodiffConfig(
+    linear_solver="sparse",
+    autodiff_jacobian_mode="sparse",
+    torch_device="cuda",
+)
+```
 
 The continuation loop, residual definition, linear assembly, S3 operators, and
 result object match the full analytical solver. Only the nonlinear derivative

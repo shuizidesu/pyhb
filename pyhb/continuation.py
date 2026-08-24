@@ -13,19 +13,22 @@ from .continuation_core import (
     _ArcLengthMetric,
     _array_is_finite,
     _coefficient_matrix,
+    _combine_linear_and_nonlinear_jacobians,
     _combine_powered_dense_blocks,
     _combine_powered_sparse_blocks,
     _evaluate_local_state,
+    _HBJacobian,
     _local_samples_to_global_coefficients,
+    _matrix_is_finite,
     _parameter_step_too_large,
     _PoweredEvaluation,
     _prepare_continuation_problem,
     _residual_stats,
     _ResidualStats,
     _shrink_arc_length_for_parameter_step,
+    _solve_linear_system,
     _solve_one_parameter_bordered_arc,
-    _solve_sparse,
-    _sparse_is_finite,
+    _validate_linear_solver,
     _validate_optional_positive_scale,
     _validate_positive_scale,
     _validated_dofs,
@@ -58,6 +61,7 @@ class ContinuationConfig:
     max_steps: int = 500
     shrink_limit: int = 20
     residual_floor: float = 1e-16
+    linear_solver: str = "sparse"
     progress_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
 
@@ -90,14 +94,14 @@ class ContinuationResult:
 @dataclass(frozen=True)
 class _NonlinearEvaluation:
     coefficients: NDArray[np.float64]
-    jacobian: sparse.csc_matrix
+    jacobian: _HBJacobian
     parameter_coefficients: NDArray[np.float64] | None = None
 
 
 def _nonlinear_evaluation_is_finite(nonlinear: _NonlinearEvaluation) -> bool:
     return (
         _array_is_finite(nonlinear.coefficients)
-        and _sparse_is_finite(nonlinear.jacobian)
+        and _matrix_is_finite(nonlinear.jacobian)
         and (nonlinear.parameter_coefficients is None or _array_is_finite(nonlinear.parameter_coefficients))
     )
 
@@ -109,6 +113,7 @@ class ContinuationSolver:
         self.model = model
         self.config = config or ContinuationConfig()
         _validate_continuation_config(self.config)
+        self._linear_solver = _validate_linear_solver(self.config.linear_solver)
         self.prepared = _prepare_continuation_problem(
             self.model,
             sample_fft=self.config.sample_fft,
@@ -175,9 +180,13 @@ class ContinuationSolver:
         nonlinear: _NonlinearEvaluation,
         parameter: float,
         powered: _PoweredEvaluation | None = None,
-    ) -> sparse.csc_matrix:
+    ) -> _HBJacobian:
         active_powered = powered or self.prepared.evaluate_powered(parameter, derivative=False)
-        return active_powered.operator + nonlinear.jacobian
+        return _combine_linear_and_nonlinear_jacobians(
+            active_powered.operator,
+            nonlinear.jacobian,
+            self._linear_solver,
+        )
 
     def _evaluate_nonlinear(
         self,
@@ -225,6 +234,7 @@ class ContinuationSolver:
             self.prepared.t.size,
             self.model.n_dof,
             "local nonlinear",
+            self._linear_solver,
         )
         parameter_coefficients = None
         if include_parameter:
@@ -272,7 +282,7 @@ class ContinuationSolver:
         NDArray[np.float64],
         NDArray[np.float64],
         _NonlinearEvaluation,
-        sparse.csc_matrix,
+        _HBJacobian,
         _PoweredEvaluation,
         StepLog,
     ]:
@@ -297,7 +307,7 @@ class ContinuationSolver:
             residual_terms = self._residual_terms(coeff_line, nonlinear, parameter, powered)
             residual_vector = residual_terms[0]
             residual_stats = _residual_stats(residual_vector, residual_terms[1:], config.residual_floor)
-            delta = _solve_sparse(jacobian, residual_vector)
+            delta = _solve_linear_system(jacobian, residual_vector, self._linear_solver)
             coeff_line = coeff_line + delta
             epoch += 1
 
@@ -328,9 +338,9 @@ class ContinuationSolver:
         return self._arc_metric.normalize(oriented)
 
     def _initial_tangent(
-        self, jacobian: sparse.csc_matrix, parameter_column: NDArray[np.float64]
+        self, jacobian: _HBJacobian, parameter_column: NDArray[np.float64]
     ) -> NDArray[np.float64]:
-        tangent_q = _solve_sparse(jacobian, parameter_column.reshape(-1))
+        tangent_q = _solve_linear_system(jacobian, parameter_column.reshape(-1), self._linear_solver)
         return self._orient_initial_tangent(np.concatenate((tangent_q, np.array([1.0], dtype=np.float64))))
 
     def _run_full(
@@ -408,7 +418,7 @@ class ContinuationSolver:
                         break
                     powered = self.prepared.evaluate_powered(parameter, derivative=True)
                     jacobian = self._jacobian(nonlinear, parameter, powered)
-                    if not _sparse_is_finite(jacobian):
+                    if not _matrix_is_finite(jacobian):
                         nonfinite_trial = True
                         break
                     residual_terms = self._residual_terms(coeff_line, nonlinear, parameter, powered)
@@ -429,6 +439,7 @@ class ContinuationSolver:
                         self._arc_metric.constraint_row(tangent),
                         residual_vector,
                         arc_residual,
+                        self._linear_solver,
                     )
                     delta = arc_solve.delta
                     if not _array_is_finite(delta) or not _array_is_finite(arc_solve.tangent_candidate):
@@ -558,6 +569,7 @@ def _validate_initial_direction(value: str) -> None:
 
 def _validate_continuation_config(config: ContinuationConfig) -> None:
     _validate_initial_direction(config.initial_direction)
+    _validate_linear_solver(config.linear_solver)
     _validate_positive_scale("q_scale", config.q_scale)
     _validate_positive_scale("omega_scale", config.omega_scale)
     _validate_optional_positive_scale("max_parameter_step", config.max_parameter_step)

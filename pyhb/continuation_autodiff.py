@@ -58,6 +58,10 @@ class ContinuationAutodiffSolver(ContinuationSolver):
             raise TypeError("ContinuationAutodiffSolver requires an AutodiffSecondOrderTimeModel")
         active_config = config or ContinuationAutodiffConfig()
         jacobian_mode = _validate_autodiff_jacobian_mode(active_config.autodiff_jacobian_mode)
+        if active_config.linear_solver == "dense" and jacobian_mode == "sparse":
+            raise ValueError(
+                "linear_solver='dense' requires autodiff_jacobian_mode='dense'"
+            )
         super().__init__(model, active_config)
         self.model: AutodiffSecondOrderTimeModel
         self.config: ContinuationAutodiffConfig
@@ -111,6 +115,7 @@ class ContinuationAutodiffSolver(ContinuationSolver):
                 self.prepared.t.size,
                 self.model.n_dof,
                 "local nonlinear",
+                self._linear_solver,
             )
         else:
             nonlinear_jacobian = assemble_hb_jacobian_from_compact_fourier(

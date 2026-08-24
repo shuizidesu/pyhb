@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import sparse
+from scipy import linalg, sparse
 from scipy.sparse.linalg import splu
 
 from .harmonics import coefficient_matrix_from_fft, generate_hb_items, stack_fft_coefficients
@@ -23,6 +24,37 @@ class _StructuredHBModel(Protocol):
     def linear_operator_terms(self) -> Sequence[LinearOperatorTerm]: ...
 
     def forcing_terms(self, t: NDArray[np.float64]) -> Sequence[ForcingTerm]: ...
+
+
+_HBJacobian = sparse.csc_matrix | NDArray[np.float64]
+
+
+class _LinearFactorization(Protocol):
+    def solve(self, rhs: NDArray[np.float64]) -> NDArray[np.float64]: ...
+
+
+@dataclass(frozen=True)
+class _SparseFactorization:
+    factor: object
+
+    def solve(self, rhs: NDArray[np.float64]) -> NDArray[np.float64]:
+        return np.asarray(self.factor.solve(np.asarray(rhs, dtype=np.float64)), dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class _DenseFactorization:
+    lu: NDArray[np.float64]
+    pivots: NDArray[np.int32]
+
+    def solve(self, rhs: NDArray[np.float64]) -> NDArray[np.float64]:
+        return np.asarray(
+            linalg.lu_solve(
+                (self.lu, self.pivots),
+                np.asarray(rhs, dtype=np.float64),
+                check_finite=False,
+            ),
+            dtype=np.float64,
+        )
 
 
 @dataclass
@@ -127,9 +159,11 @@ def assemble_hb_jacobian_from_local_matrices(
     sample_count: int,
     n_dof: int,
     label: str,
-) -> sparse.csc_matrix:
-    """Project batched local Jacobian matrices and scatter them into HB space."""
+    linear_solver: str = "sparse",
+) -> _HBJacobian:
+    """Project batched local Jacobian matrices into sparse or dense HB space."""
 
+    active_linear_solver = _validate_linear_solver(linear_solver)
     order = context.order
     size = n_dof * order
     if not isinstance(jacobians, LocalJacobianMatrices):
@@ -154,6 +188,8 @@ def assemble_hb_jacobian_from_local_matrices(
         active.append((variable, array, s3_matrix))
 
     if not active or force_count == 0 or coordinate_count == 0:
+        if active_linear_solver == "dense":
+            return np.zeros((size, size), dtype=np.float64, order="F")
         return sparse.csc_matrix((size, size), dtype=np.float64)
 
     local_pair_count = force_count * coordinate_count
@@ -168,14 +204,6 @@ def assemble_hb_jacobian_from_local_matrices(
         context.nonlinear_harmonic_indices,
     )
 
-    force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
-    coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
-    force_columns = np.repeat(force_dofs_array, coordinate_count)
-    coordinate_columns = np.tile(coordinate_dofs_array, force_count)
-    local_rows = np.tile(np.arange(order, dtype=np.int64), order)
-    local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
-    row_indices = force_columns[:, None] * order + local_rows[None, :]
-    col_indices = coordinate_columns[:, None] * order + local_cols[None, :]
     combined_blocks_flat = np.zeros((local_pair_count, order * order), dtype=np.float64)
 
     coefficient_offset = 0
@@ -187,10 +215,60 @@ def assemble_hb_jacobian_from_local_matrices(
         coefficient_offset += local_pair_count
         combined_blocks_flat += np.asarray(s3_matrix @ variable_coefficients).T
 
+    if active_linear_solver == "dense":
+        return _assemble_dense_hb_jacobian(
+            combined_blocks_flat,
+            force_dofs,
+            coordinate_dofs,
+            order,
+            n_dof,
+        )
+
+    force_dofs_array = np.asarray(force_dofs, dtype=np.int64)
+    coordinate_dofs_array = np.asarray(coordinate_dofs, dtype=np.int64)
+    force_columns = np.repeat(force_dofs_array, coordinate_count)
+    coordinate_columns = np.tile(coordinate_dofs_array, force_count)
+    local_rows = np.tile(np.arange(order, dtype=np.int64), order)
+    local_cols = np.repeat(np.arange(order, dtype=np.int64), order)
+    row_indices = force_columns[:, None] * order + local_rows[None, :]
+    col_indices = coordinate_columns[:, None] * order + local_cols[None, :]
     rows = row_indices.reshape(-1)
     cols = col_indices.reshape(-1)
     data = combined_blocks_flat.reshape(-1)
     return sparse.coo_matrix((data, (rows, cols)), shape=(size, size)).tocsc()
+
+
+def _assemble_dense_hb_jacobian(
+    combined_blocks_flat: NDArray[np.float64],
+    force_dofs: Sequence[int],
+    coordinate_dofs: Sequence[int],
+    order: int,
+    n_dof: int,
+) -> NDArray[np.float64]:
+    """Arrange local force-coordinate HB blocks in one dense global matrix."""
+
+    force_count = len(force_dofs)
+    coordinate_count = len(coordinate_dofs)
+    local_matrix = (
+        combined_blocks_flat.reshape(force_count, coordinate_count, order, order)
+        .transpose(0, 3, 1, 2)
+        .reshape(force_count * order, coordinate_count * order)
+    )
+    full_dofs = tuple(range(n_dof))
+    if tuple(force_dofs) == full_dofs and tuple(coordinate_dofs) == full_dofs:
+        return np.asfortranarray(local_matrix)
+
+    size = n_dof * order
+    jacobian = np.zeros((size, size), dtype=np.float64, order="F")
+    harmonic_indices = np.arange(order, dtype=np.int64)
+    force_indices = (
+        np.asarray(force_dofs, dtype=np.int64)[:, None] * order + harmonic_indices[None, :]
+    ).reshape(-1)
+    coordinate_indices = (
+        np.asarray(coordinate_dofs, dtype=np.int64)[:, None] * order + harmonic_indices[None, :]
+    ).reshape(-1)
+    jacobian[np.ix_(force_indices, coordinate_indices)] = local_matrix
+    return jacobian
 
 
 def assemble_hb_jacobian_from_compact_fourier(
@@ -555,24 +633,73 @@ def _parameter_derivative_scale(parameter: float, power: float) -> float:
     return power * parameter ** (power - 1.0)
 
 
-def _solve_sparse(matrix: sparse.spmatrix, rhs: NDArray[np.float64]) -> NDArray[np.float64]:
-    return splu(matrix.tocsc()).solve(np.asarray(rhs, dtype=np.float64))
+def _validate_linear_solver(value: str) -> str:
+    linear_solver = str(value)
+    if linear_solver not in {"sparse", "dense"}:
+        raise ValueError("linear_solver must be either 'sparse' or 'dense'")
+    return linear_solver
+
+
+def _factorize_linear_system(matrix: _HBJacobian, linear_solver: str) -> _LinearFactorization:
+    active_linear_solver = _validate_linear_solver(linear_solver)
+    if active_linear_solver == "sparse":
+        return _SparseFactorization(splu(sparse.csc_matrix(matrix, dtype=np.float64)))
+
+    dense_matrix = (
+        matrix.toarray(order="F")
+        if sparse.issparse(matrix)
+        else np.array(matrix, dtype=np.float64, order="F", copy=True)
+    )
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", linalg.LinAlgWarning)
+            lu, pivots = linalg.lu_factor(dense_matrix, overwrite_a=True, check_finite=False)
+    except linalg.LinAlgWarning as error:
+        raise np.linalg.LinAlgError(str(error)) from error
+    return _DenseFactorization(lu, pivots)
+
+
+def _solve_linear_system(
+    matrix: _HBJacobian,
+    rhs: NDArray[np.float64],
+    linear_solver: str,
+) -> NDArray[np.float64]:
+    return _factorize_linear_system(matrix, linear_solver).solve(rhs)
 
 
 def _array_is_finite(values: NDArray[np.float64] | float) -> bool:
     return bool(np.all(np.isfinite(np.asarray(values, dtype=np.float64))))
 
 
-def _sparse_is_finite(matrix: sparse.spmatrix) -> bool:
-    return bool(np.all(np.isfinite(matrix.data)))
+def _matrix_is_finite(matrix: _HBJacobian) -> bool:
+    values = matrix.data if sparse.issparse(matrix) else matrix
+    return bool(np.all(np.isfinite(np.asarray(values, dtype=np.float64))))
+
+
+def _combine_linear_and_nonlinear_jacobians(
+    linear_jacobian: sparse.csc_matrix,
+    nonlinear_jacobian: _HBJacobian,
+    linear_solver: str,
+) -> _HBJacobian:
+    active_linear_solver = _validate_linear_solver(linear_solver)
+    if active_linear_solver == "sparse":
+        return (linear_jacobian + sparse.csc_matrix(nonlinear_jacobian)).tocsc()
+
+    if sparse.issparse(nonlinear_jacobian):
+        raise TypeError("dense linear solver requires a dense nonlinear Jacobian")
+    result = np.array(nonlinear_jacobian, dtype=np.float64, order="F", copy=True)
+    linear_coo = linear_jacobian.tocoo(copy=False)
+    result[linear_coo.row, linear_coo.col] += linear_coo.data
+    return result
 
 
 def _solve_one_parameter_bordered_arc(
-    jacobian: sparse.spmatrix,
+    jacobian: _HBJacobian,
     parameter_column: NDArray[np.float64],
     arc_row: NDArray[np.float64],
     residual_vector: NDArray[np.float64],
     arc_residual: float,
+    linear_solver: str = "sparse",
 ) -> _BorderedArcSolve:
     """Solve the one-parameter arc-length bordered system without factoring it.
 
@@ -590,9 +717,9 @@ def _solve_one_parameter_bordered_arc(
     arc_parameter = float(arc_vector[-1])
 
     try:
-        lu = splu(jacobian.tocsc())
-        residual_solve = lu.solve(-residual)
-        parameter_solve = lu.solve(parameter_column_vector)
+        factorization = _factorize_linear_system(jacobian, linear_solver)
+        residual_solve = factorization.solve(-residual)
+        parameter_solve = factorization.solve(parameter_column_vector)
         denominator = float(arc_q @ parameter_solve + arc_parameter)
         tolerance = (
             100.0
@@ -614,6 +741,7 @@ def _solve_one_parameter_bordered_arc(
             arc_vector,
             residual,
             arc_residual,
+            linear_solver,
         )
 
     parameter_delta = (float(arc_residual) - float(arc_q @ residual_solve)) / denominator
@@ -647,11 +775,18 @@ def _residual_stats(
 
 
 def _augmented_arc_matrix(
-    jacobian: sparse.spmatrix,
+    jacobian: _HBJacobian,
     parameter_column: NDArray[np.float64],
     arc_row: NDArray[np.float64],
-) -> sparse.csc_matrix:
+    linear_solver: str = "sparse",
+) -> _HBJacobian:
     size = jacobian.shape[0]
+    if _validate_linear_solver(linear_solver) == "dense":
+        augmented = np.empty((size + 1, size + 1), dtype=np.float64, order="F")
+        augmented[:size, :size] = -np.asarray(jacobian, dtype=np.float64)
+        augmented[:size, size] = np.asarray(parameter_column, dtype=np.float64).reshape(size)
+        augmented[size, :] = np.asarray(arc_row, dtype=np.float64).reshape(size + 1)
+        return augmented
     parameter_sparse = sparse.csc_matrix(np.asarray(parameter_column, dtype=np.float64).reshape(size, 1))
     arc_sparse = sparse.csr_matrix(np.asarray(arc_row, dtype=np.float64).reshape(1, size + 1))
     top = sparse.hstack((-jacobian, parameter_sparse), format="csc")
@@ -659,18 +794,19 @@ def _augmented_arc_matrix(
 
 
 def _solve_augmented_one_parameter_bordered_arc(
-    jacobian: sparse.spmatrix,
+    jacobian: _HBJacobian,
     parameter_column: NDArray[np.float64],
     arc_row: NDArray[np.float64],
     residual_vector: NDArray[np.float64],
     arc_residual: float,
+    linear_solver: str = "sparse",
 ) -> _BorderedArcSolve:
     size = jacobian.shape[0]
-    augmented = _augmented_arc_matrix(jacobian, parameter_column, arc_row)
-    lu = splu(augmented)
+    augmented = _augmented_arc_matrix(jacobian, parameter_column, arc_row, linear_solver)
+    factorization = _factorize_linear_system(augmented, linear_solver)
     delta_rhs = np.concatenate((np.asarray(residual_vector, dtype=np.float64).reshape(size), np.array([arc_residual])))
     tangent_rhs = np.concatenate((np.zeros(size, dtype=np.float64), np.array([1.0])))
     return _BorderedArcSolve(
-        delta=lu.solve(delta_rhs),
-        tangent_candidate=lu.solve(tangent_rhs),
+        delta=factorization.solve(delta_rhs),
+        tangent_candidate=factorization.solve(tangent_rhs),
     )
